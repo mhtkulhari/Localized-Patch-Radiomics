@@ -1854,6 +1854,42 @@ PATCH_INITIAL_EXPORT_CASE_LIMIT = 1
 DEFAULT_PATCH_STAGE = "all"
 _MODEL_CACHE: dict[tuple[str, str, str], dict] = {}
 
+_MAXPOOL_SCALE_TO_IDX = {str(sc["name"]): i for i, sc in enumerate(PATCH_SCALES)}
+
+
+def _maxpool_case_path(feature_set: str, case_id: str) -> Path:
+    return PATCH_INFERENCE_RAW_PRED_DIR / str(feature_set) / f"{case_id}.npz"
+
+
+def _maxpool_done_ids(feature_set: str) -> set[str]:
+    folder = PATCH_INFERENCE_RAW_PRED_DIR / str(feature_set)
+    return {p.stem for p in folder.glob("*.npz")} if folder.exists() else set()
+
+
+def _all_maxpool_detection_caches_exist(case_ids: list[str] | None = None) -> bool:
+    expected = {str(c).strip() for c in (case_ids if case_ids is not None else list_case_ids(MAIN_ROOT))}
+    return bool(expected) and all(expected.issubset(_maxpool_done_ids(fs)) for fs in PATCH_FEATURE_SETS)
+
+
+def _write_maxpool_case_cache(case, feature_set: str, scored_parts: list[pd.DataFrame]) -> None:
+    if not scored_parts:
+        return
+    scored = pd.concat(scored_parts, ignore_index=True)
+    path = _maxpool_case_path(feature_set, case.case_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scale_idx = scored["scale"].astype(str).map(_MAXPOOL_SCALE_TO_IDX).to_numpy(np.int8)
+    tmp = path.with_suffix(".npz.tmp")
+    with tmp.open("wb") as fh:
+        np.savez_compressed(
+            fh,
+            case_id=str(case.case_id),
+            centers=scored[["center_z", "center_y", "center_x"]].to_numpy(np.int16),
+            scale_idx=scale_idx,
+            scores=scored.reindex(columns=SCORE_COLS).to_numpy(np.float32),
+            organ_shape=np.asarray(case.organ.shape, dtype=np.int32),
+        )
+    os.replace(tmp, path)
+
 
 def _case_key(case_id: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(case_id).strip().lower())
@@ -2272,13 +2308,13 @@ def _extract_external_scale_table(scale: dict) -> pd.DataFrame:
     sc = normalize_scale(scale)
     case_ids = list_case_ids(PRETRAIN_ROOT)
     tasks = [(scale, case_id) for case_id in case_ids]
-    frames: list[pd.DataFrame] = []
+    frames_by_case: dict[str, pd.DataFrame] = {}
 
     def _run_seq() -> None:
         for task in tasks:
             case_id, df, status = _extract_external_case_task(task)
             if df is not None:
-                frames.append(df)
+                frames_by_case[str(case_id)] = df
             _vprint(f"[PATCH TRAIN][{sc.name}] {case_id}: {status}")
 
     if PATCH_WORKERS <= 1:
@@ -2294,13 +2330,14 @@ def _extract_external_scale_table(scale: dict) -> pd.DataFrame:
                     cfg.log_progress("PATCH_TRAIN", completed, total)
                     case_id, df, status = f.result()
                     if df is not None:
-                        frames.append(df)
+                        frames_by_case[str(case_id)] = df
                     _vprint(f"[PATCH TRAIN][{sc.name}] {case_id}: {status}")
         except BrokenProcessPool:
             print(f"[PATCH TRAIN][{sc.name}] WARNING: a worker died; retrying this scale sequentially.")
-            frames.clear()
+            frames_by_case.clear()
             _run_seq()
 
+    frames = [frames_by_case[str(case_id)] for case_id in case_ids if str(case_id) in frames_by_case]
     if not frames:
         raise RuntimeError(f"No external patches produced for scale {sc.name}")
     out = pd.concat(frames, ignore_index=True)
@@ -2553,10 +2590,12 @@ def _write_patch_prediction_table(feature_set: str, df: pd.DataFrame) -> None:
         "patch_y",
         "patch_x",
         "csPCa_likelihood",
+        "non_csPCa_likelihood",
         "PZ_likelihood",
+        "TZ_likelihood",
     ]
     _write_scale_csv_table(path, df, pred_cols)
-    print(f"[PATCH APPLY][{feature_set}] saved first-{PATCH_INITIAL_EXPORT_CASE_LIMIT}-case detection view {path} rows={len(df)}")
+    print(f"[PATCH APPLY][{feature_set}] saved detection preview {path} rows={len(df)}")
 
 
 def _write_inference_raw_feature_table(feature_set: str, df: pd.DataFrame) -> None:
@@ -2810,6 +2849,7 @@ def _process_main_patch_case_task(task: tuple[str, bool]):
 
     out_row = {ID_COL: str(case_id)}
     multiscale_parts: dict[str, list[dict[str, float | str]]] = {feature_set: [] for feature_set in PATCH_FEATURE_SETS}
+    maxpool_parts: dict[str, list[pd.DataFrame]] = {feature_set: [] for feature_set in PATCH_FEATURE_SETS}
     prediction_parts = {feature_set: [] for feature_set in PATCH_FEATURE_SETS} if is_view else None
     raw_feature_parts = {feature_set: [] for feature_set in PATCH_FEATURE_SETS} if is_view else None
     for scale in PATCH_SCALES:
@@ -2818,6 +2858,9 @@ def _process_main_patch_case_task(task: tuple[str, bool]):
         for feature_set in PATCH_FEATURE_SETS:
             feature_df = _feature_set_table(patch_df, feature_set, include_labels=False)
             scored = _score_patch_table(feature_df, sc.name, feature_set)
+            maxpool_parts[feature_set].append(scored.reindex(columns=[
+                "scale", "center_z", "center_y", "center_x", *SCORE_COLS,
+            ]))
             multiscale_parts[feature_set].append(_scale_signal_metrics(sc.name, scored, "csPCa_likelihood"))
             out_row.update(_summarize_case_scale(case, sc, scored, save_heatmaps=False, feature_set=feature_set))
             if is_view:
@@ -2827,6 +2870,9 @@ def _process_main_patch_case_task(task: tuple[str, bool]):
                     "patch_z", "patch_y", "patch_x", "organ_overlap", *SCORE_COLS,
                 ]
                 prediction_parts[feature_set].append(scored.reindex(columns=[c for c in pred_cols if c in scored.columns]))
+
+    for feature_set, scored_parts in maxpool_parts.items():
+        _write_maxpool_case_cache(case, feature_set, scored_parts)
 
     for feature_set, metrics in multiscale_parts.items():
         out_row.update(_multiscale_agreement_features(feature_set, metrics))
@@ -2862,8 +2908,8 @@ def apply_patch_helpers(allow_missing_models: bool = False, write_views: bool = 
     expected_ids = {str(c).strip() for c in case_ids}
 
     paths = _expected_patch_workbook_paths()
-    if _all_final_patch_workbooks_exist():
-        print("[PATCH APPLY] final A_Patch summary features already exist; skipping apply")
+    if _all_final_patch_workbooks_exist() and _all_maxpool_detection_caches_exist(case_ids):
+        print("[PATCH APPLY] final A_Patch summaries and max-pool detection caches already exist; skipping apply")
         return pd.DataFrame({ID_COL: sorted(expected_ids)})
 
     existing_by_file: dict[str, pd.DataFrame] = {}
@@ -2876,6 +2922,8 @@ def apply_patch_helpers(allow_missing_models: bool = False, write_views: bool = 
         else:
             done_case_ids = set()
     done_case_ids = done_case_ids or set()
+    for feature_set in PATCH_FEATURE_SETS:
+        done_case_ids &= _maxpool_done_ids(feature_set)
     if done_case_ids:
         print(f"[PATCH APPLY] resume: {len(done_case_ids)} cases already published in {PATCH_ONLY_WORKBOOK_DIR}")
     elif not existing_by_file:

@@ -1325,6 +1325,11 @@ def _organ_roi_patch_features(vol: np.ndarray, mask: np.ndarray) -> Tuple[Dict[s
 def extract_patchstyle_tables(root: Path, mask_folder: str = MASK_FOLDER) -> dict[str, pd.DataFrame]:
     root = Path(root)
     t2w_dir, adc_dir, mask_dir = feature_paths(root, mask_folder)
+    missing_dirs = [path for path in (t2w_dir, adc_dir, mask_dir) if not Path(path).is_dir()]
+    if missing_dirs:
+        raise FileNotFoundError(
+            "Missing patch-style input folder(s): " + ", ".join(map(str, missing_dirs))
+        )
     case_ids = list_case_ids(t2w_dir, ext=".mha")
 
     rows = {"texture_t2w": [], "texture_adc": [], "topology_t2w": [], "topology_adc": []}

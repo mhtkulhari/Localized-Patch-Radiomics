@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import builtins as _builtins
 from datetime import datetime as _dt
 from pathlib import Path
@@ -12,7 +13,7 @@ if hasattr(sys.stdout, "reconfigure"):
 _ORIG_PRINT = _builtins.print
 
 def _timestamped_print(*args, **kwargs):
-    if not args:  # bare print() used only for blank spacer lines -> leave as-is
+    if not args:  
         _ORIG_PRINT(*args, **kwargs)
         return
     stamp = _dt.now().strftime("%H:%M:%S.%f")[:-3] + " | "
@@ -66,9 +67,9 @@ EARLY_FUSION_WORKBOOK_DIR = C_EARLY_DIR / "01_fused_features"
 EXPERIMENT_LAYOUT = {
     "A":  {"root": A_PATCH_DIR,      "results": "06_results", "final": "07_final_model", "external": "08_external_testing", "prefix": "patch"},
     "B":  {"root": B_ORGAN_DIR,      "results": "03_results", "final": "04_final_model", "external": "05_external_testing", "prefix": "organ"},
-    "B0": {"root": B_ORGAN_SAME_DIR, "results": "03_results", "final": None,             "external": None,                 "prefix": "organ_same"},
+    "B0": {"root": B_ORGAN_SAME_DIR, "results": "03_results", "final": "04_final_model", "external": "05_external_testing", "prefix": "organ_same"},
     "C":  {"root": C_EARLY_DIR,      "results": "02_results", "final": "03_final_model", "external": "04_external_testing", "prefix": "early"},
-    "D":  {"root": D_LATE_DIR,       "results": "01_results", "final": "02_final_model", "external": "03_external_testing", "prefix": "late"},
+    "D":  {"root": D_LATE_DIR,       "results": "01_results", "final": "02_final_model", "external": "02_external_testing", "prefix": "late"},
 }
 
 def results_dir(exp: str, seed: int) -> Path:
@@ -238,15 +239,15 @@ def log_progress(stage: str, completed: int, total: int, metric: str = "items") 
         pct = milestones[curr_bucket - 1]
         print(f"[{stage}] {completed}/{total} {metric} ({pct}%)")
 
-RANDOM_STATE = 7
+RANDOM_STATE = 42
 RANDOM_SEEDS = [7, 21, 42, 73, 101]
 
-DEFAULT_INTERNAL_EXPERIMENTS = "A,B,C"
-DEFAULT_EXTERNAL_EXPERIMENTS = "A,B,C,D"
-DEFAULT_STACK_EXPERIMENTS = "A,B,C,D"
+DEFAULT_INTERNAL_EXPERIMENTS = "A,B,B0,C"
+DEFAULT_EXTERNAL_EXPERIMENTS = "A,B,B0,C,D"
+DEFAULT_STACK_EXPERIMENTS = "A,B,B0,C,D"
 DEFAULT_PIPELINE_EXPERIMENTS = "A,B,B0,C,D"
-DEFAULT_LATE_FUSION_ALPHA_GRID = "0.25,0.5,0.75"
-DEFAULT_STACKING_TOP_K = 8
+LATE_FUSION_ALPHA = 0.5
+DEFAULT_STACKING_TOP_K = 4
 
 PATCH_ONLY_RESULTS_DIR = results_dir("A", RANDOM_STATE)
 ORGAN_ONLY_RESULTS_DIR = results_dir("B", RANDOM_STATE)
@@ -290,15 +291,8 @@ ZONE_VALUE_TO_LABEL = {
 _PATCH_FEATURE_SET_PREFIX = "feature--"
 
 FEATURE_FILES = [
-    "feature--t2w.csv",
-    "feature--adc.csv",
     "feature--concat.csv",
-    "feature--hada.csv",
-    "feature--diff.csv",
-    "feature--fusion(cd).csv",
     "feature--fusion(dh).csv",
-    "feature--fusion(ch).csv",
-    "feature--fusion(cdh).csv",
 ]
 
 PATCH_FEATURE_SETS = [Path(name).stem[len(_PATCH_FEATURE_SET_PREFIX):] for name in FEATURE_FILES]
@@ -308,15 +302,33 @@ PATCH_FEATURE_SET_BY_FILE = dict(zip(FEATURE_FILES, PATCH_FEATURE_SETS))
 PATCH_MODALITIES = ["t2w", "adc"]
 
 ML_FEATURE_SELECTORS = [
-    "anova_f",
     "l1_embedded",
 ]
 ML_CLASSIFIERS = [
     "logreg",
-    "linear_svm",
-    "gaussian_nb",
     "lda",
 ]
+
+# B/B0/C use the classical route for both tasks. A uses the classical route
+# for csPCa and the max-pool route for zone. D consumes the final A/B scores.
+CLASSICAL_TASKS = ("cs", "zone")
+PATCH_CLASSICAL_TASKS = ("cs",)
+
+def classical_tasks_for_experiment(exp: str) -> tuple[str, ...]:
+    exp = str(exp).upper()
+    if exp not in EXPERIMENT_LAYOUT:
+        raise ValueError(f"Unknown experiment {exp!r}. Choices: {sorted(EXPERIMENT_LAYOUT)}")
+    return PATCH_CLASSICAL_TASKS if exp == "A" else CLASSICAL_TASKS
+
+MAXPOOL_TASK = "zone"
+MAXPOOL_FEATURE_SETS = tuple(PATCH_FEATURE_SETS)
+MAXPOOL_BAG_CAP = 6000
+MAXPOOL_EPOCHS = 120
+MAXPOOL_PATIENCE = 20
+MAXPOOL_ENSEMBLE_MEMBERS = 5
+
+def external_detection_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "bspc_external_detection_by_helper"
 
 PATCH_SCALES = [
     {"name": "s1", "size_mm_zyx": (3.0, 3.5, 3.5), "stride_mm_zyx": (3.0, 1.0, 1.0)},

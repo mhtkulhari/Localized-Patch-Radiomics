@@ -20,23 +20,19 @@ from sklearn.metrics import (
 from all_config import (
     ID_COL,
     CLIN_COL,
+    CLASSICAL_TASKS,
     ZONE_COL,
     FEATURE_FILES,
     ORGAN_ONLY_WORKBOOK_DIR,
     PATCH_ONLY_WORKBOOK_DIR,
     EARLY_FUSION_WORKBOOK_DIR,
     RANDOM_SEEDS,
+    RANDOM_STATE,
     results_dirs_for_seed,
     read_features,
-    read_predictions,
     write_table,
-    write_predictions,
 )
 import all_config as cfg
-
-LATE_KEY_COLS = ["file", "fs_method", "clf_model", "alpha"]
-LATE_METRICS = ["auc", "f1", "sensitivity", "specificity", "accuracy"]
-FINAL_REPORT_NAME = "ml_top10.txt"
 
 
 def _early_fusion_sheet(main_df: pd.DataFrame, helper: pd.DataFrame) -> pd.DataFrame:
@@ -89,13 +85,13 @@ def build_early_fusion_workbooks(
     return report
 
 
-def _read_predictions(results_dir: Path, file_tag: str, task: str) -> pd.DataFrame:
-    path = Path(results_dir) / file_tag / f"predictions_{task}_{file_tag}.csv"
+def _read_maxpool_zone_predictions(patch_results_dir: Path) -> pd.DataFrame:
+    path = Path(patch_results_dir) / "maxpool_zone.xlsx"
     if not path.exists():
-        raise FileNotFoundError(f"Missing required prediction table for late fusion: {path}")
-    df = read_predictions(path)
+        raise FileNotFoundError(f"Missing A_Patch max-pool zone predictions for late fusion: {path}")
+    df = pd.read_excel(path, sheet_name="predictions", dtype={ID_COL: str})
     if df.empty:
-        raise RuntimeError(f"Prediction table has no rows for late fusion: {path}")
+        raise RuntimeError(f"A_Patch max-pool zone prediction sheet has no rows: {path}")
     return df
 
 
@@ -132,187 +128,158 @@ def _metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndarray) -> dic
     }
 
 
-def _summarize_late_fusion(fold_df: pd.DataFrame) -> pd.DataFrame:
-    if fold_df.empty:
-        return pd.DataFrame()
-    group_cols = ["file", "fs_method", "clf_model", "alpha"]
-    rows = []
-    for keys, group in fold_df.groupby(group_cols, dropna=False):
-        row = dict(zip(group_cols, keys))
-        row["n_outer_folds"] = int(group["outer_fold"].nunique())
-        for metric in ["auc", "ap", "balanced_acc", "f1", "accuracy", "sensitivity", "specificity"]:
-            vals = pd.to_numeric(group[metric], errors="coerce")
-            row[f"{metric}_mean"] = round(float(vals.mean()), 4)
-            row[f"{metric}_std"] = round(float(vals.std(ddof=0)), 4)
-        rows.append(row)
-    out = pd.DataFrame(rows)
-    return out.sort_values(["auc_mean", "f1_mean", "accuracy_mean"], ascending=[False, False, False]).reset_index(drop=True)
+def _fixed_threshold(task: str) -> float:
+    return 0.45 if str(task).lower() == "zone" else 0.5
 
 
-def _write_excel(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name[:31], index=False)
-        cfg.format_float_cells_4dp(writer)
-
-
-def _minimal_late_summary(summary_df: pd.DataFrame, suffix: str) -> pd.DataFrame:
-    out_cols = LATE_KEY_COLS + [f"{metric}_{suffix}" for metric in LATE_METRICS]
-    if summary_df is None or summary_df.empty:
-        return pd.DataFrame(columns=out_cols)
-    needed = LATE_KEY_COLS + [f"{metric}_mean" for metric in LATE_METRICS]
-    work = summary_df.copy()
-    for col in needed:
-        if col not in work.columns:
-            work[col] = np.nan
-    out = work[needed].copy()
-    out = out.rename(columns={f"{metric}_mean": f"{metric}_{suffix}" for metric in LATE_METRICS})
-    return out[out_cols]
-
-
-def _sort_combo(df: pd.DataFrame, metric_cols: list[str]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    sort_cols = [col for col in metric_cols if col in df.columns] + [col for col in LATE_KEY_COLS if col in df.columns]
-    ascending = [False] * len([col for col in metric_cols if col in df.columns])
-    ascending.extend([True] * (len(sort_cols) - len(ascending)))
-    return df.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
-
-
-def _write_late_fusion_combined(cs_summary: pd.DataFrame, zone_summary: pd.DataFrame) -> pd.DataFrame:
-    cs_min = _minimal_late_summary(cs_summary, "cs")
-    zone_min = _minimal_late_summary(zone_summary, "zone")
-    merged = cs_min.merge(zone_min, on=LATE_KEY_COLS, how="inner")
-    if merged.empty:
-        combo = pd.DataFrame(columns=LATE_KEY_COLS + LATE_METRICS)
-    else:
-        combo = merged[LATE_KEY_COLS].copy()
-        for metric in LATE_METRICS:
-            combo[metric] = ((merged[f"{metric}_cs"] + merged[f"{metric}_zone"]) / 2.0).round(4)
-        combo = _sort_combo(combo, ["auc", "f1", "accuracy"])
-    return combo
-
-
-def _top_report_df(df: pd.DataFrame, metric_cols: list[str], top_n: int = 10) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    work = df.copy()
-    key_cols = [col for col in LATE_KEY_COLS if col in work.columns]
-    cols = key_cols + [col for col in metric_cols if col in work.columns]
-    if "n_outer_folds" in work.columns:
-        cols.append("n_outer_folds")
-    cols = list(dict.fromkeys(cols))
-    sort_cols = [col for col in metric_cols if col in work.columns]
-    return work.sort_values(
-        sort_cols + key_cols,
-        ascending=[False] * len(sort_cols) + [True] * len(key_cols),
-        kind="stable",
-    )[cols].head(top_n).reset_index(drop=True)
-
-
-def _write_top10_report_section(lines: list[str], title: str, df: pd.DataFrame) -> None:
-    lines.append(title)
-    if df is None or df.empty:
-        lines.append("No rows.")
-    else:
-        lines.append(df.to_string(index=False))
-    lines.append("")
-
-
-def _write_late_fusion_top10_report(report_txt: Path, alpha_grid: list[float], cs_summaries, zone_summaries, combo_summaries) -> None:
-    cs_all = pd.concat([df for df in cs_summaries if df is not None and not df.empty], ignore_index=True) if cs_summaries else pd.DataFrame()
-    zone_all = pd.concat([df for df in zone_summaries if df is not None and not df.empty], ignore_index=True) if zone_summaries else pd.DataFrame()
-    combo_all = pd.concat([df for df in combo_summaries if df is not None and not df.empty], ignore_index=True) if combo_summaries else pd.DataFrame()
-    task_metrics = ["auc_mean", "f1_mean", "sensitivity_mean", "specificity_mean", "accuracy_mean"]
-    combo_metrics = ["auc", "f1", "sensitivity", "specificity", "accuracy"]
-    lines = [
-        "================ FINAL TOP-10 REPORT ================",
-        "Experiment: D_Late",
-        "Alpha grid: " + ", ".join(str(x) for x in alpha_grid),
-        "",
-    ]
-    _write_top10_report_section(lines, "[CS summary]", _top_report_df(cs_all, task_metrics))
-    _write_top10_report_section(lines, "[ZONE summary]", _top_report_df(zone_all, task_metrics))
-    _write_top10_report_section(lines, "[CS/ZONE average summary]", _top_report_df(combo_all, combo_metrics))
-    report_txt.parent.mkdir(parents=True, exist_ok=True)
-    report_txt.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+def _read_final_stacking_predictions(results_dir: Path, task: str) -> pd.DataFrame:
+    path = Path(results_dir) / "final_stacking.xlsx"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing final stacking predictions required for late fusion: {path}")
+    df = pd.read_excel(path, sheet_name="meta_predictions", dtype={ID_COL: str})
+    required = {"task", "outer_fold", ID_COL, "y_true", "y_score"}
+    if not required.issubset(df.columns):
+        raise RuntimeError(f"Final stacking prediction sheet has missing columns at {path}: {sorted(required - set(df.columns))}")
+    out = df[df["task"].astype(str) == task].copy()
+    if out.empty:
+        raise RuntimeError(f"No final stacking predictions for task={task} at {path}")
+    return out
 
 
 def compute_late_fusion(
-    alpha_grid: list[float],
-    organ_results_dir: Path,
     patch_results_dir: Path,
+    organ_results_dir: Path,
     late_results_dir: Path,
-    file_names: list[str] | None = None,
 ) -> list[dict]:
-    organ_results_dir = Path(organ_results_dir)
+    """Fuse final A_Patch and B_Organ out-of-fold prediction scores."""
+    import f_stack
+
+    alpha = float(cfg.LATE_FUSION_ALPHA)
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be in [0, 1]")
     patch_results_dir = Path(patch_results_dir)
+    organ_results_dir = Path(organ_results_dir)
     late_results_dir = Path(late_results_dir)
-    late_results_dir.mkdir(parents=True, exist_ok=True)
-    names = list(FEATURE_FILES if file_names is None else file_names)
-    report_txt = late_results_dir / FINAL_REPORT_NAME
-    all_reports = []
-    report_cs_summaries = []
-    report_zone_summaries = []
-    report_combo_summaries = []
 
-    for file_name in names:
-        file_tag = Path(file_name).stem
-        file_dir = late_results_dir / file_tag
-        file_dir.mkdir(parents=True, exist_ok=True)
-        task_summaries = {}
-        for task in ["cs", "zone"]:
-            organ = _read_predictions(organ_results_dir, file_tag, task)
-            patch = _read_predictions(patch_results_dir, file_tag, task)
-            key_cols = ["file", "fs_method", "clf_model", "outer_fold", "case_id"]
-            keep = key_cols + ["y_true", "y_score"]
-            merged = organ[keep].merge(
-                patch[keep],
-                on=key_cols + ["y_true"],
-                suffixes=("_organ", "_patch"),
-                how="inner",
+    fold_rows: list[dict] = []
+    pred_rows: list[dict] = []
+    selected_rows: list[dict] = []
+    base_outer_rows: list[dict] = []
+    method_rows: list[dict] = []
+
+    for task in CLASSICAL_TASKS:
+        if task == "zone":
+            patch = _read_maxpool_zone_predictions(patch_results_dir)
+        else:
+            patch = _read_final_stacking_predictions(patch_results_dir, task)
+        organ = _read_final_stacking_predictions(organ_results_dir, task)
+
+        keep = ["outer_fold", ID_COL, "y_true", "y_score"]
+        merged = patch[keep].merge(
+            organ[keep],
+            on=["outer_fold", ID_COL, "y_true"],
+            suffixes=("_a", "_b"),
+            how="inner",
+            validate="one_to_one",
+        )
+        if merged.empty:
+            raise RuntimeError(f"No matching final A/B prediction rows for late fusion task={task}")
+        if len(merged) != len(patch) or len(merged) != len(organ):
+            raise RuntimeError(
+                f"A/B final prediction coverage differs for task={task}: "
+                f"A={len(patch)} B={len(organ)} matched={len(merged)}"
             )
-            if merged.empty:
-                raise RuntimeError(f"No matching A/B prediction rows for late fusion: {file_tag}:{task}")
-            pred_parts = []
-            norm_group = ["file", "fs_method", "clf_model", "outer_fold"]
-            merged["organ_score_norm"] = merged.groupby(norm_group)["y_score_organ"].transform(_rank01)
-            merged["patch_score_norm"] = merged.groupby(norm_group)["y_score_patch"].transform(_rank01)
-            for alpha in alpha_grid:
-                d = merged.copy()
-                d["alpha"] = float(alpha)
-                d["y_score"] = alpha * d["organ_score_norm"] + (1.0 - alpha) * d["patch_score_norm"]
-                d["y_pred"] = (d["y_score"] >= 0.5).astype(int)
-                pred_parts.append(d)
-            pred_df = pd.concat(pred_parts, ignore_index=True)
-            fold_rows = []
-            fold_group_cols = ["file", "fs_method", "clf_model", "alpha", "outer_fold"]
-            for keys, group in pred_df.groupby(fold_group_cols, dropna=False):
-                row = dict(zip(fold_group_cols, keys))
-                row.update(_metrics(group["y_true"].to_numpy(), group["y_score"].to_numpy(), group["y_pred"].to_numpy()))
-                row["n_test"] = int(len(group))
-                fold_rows.append(row)
-            fold_df = pd.DataFrame(fold_rows)
-            summary_df = _summarize_late_fusion(fold_df)
-            task_summaries[task] = summary_df
-            out_book = file_dir / f"results_{task}_{file_tag}.xlsx"
-            _write_excel(out_book, {"combo_summary": cfg.collapse_mean_std_columns(cfg.round_metrics(summary_df)), "fold_metrics": cfg.round_metrics(fold_df)})
-            write_predictions(pred_df, file_dir / f"predictions_{task}_{file_tag}.csv")
-            all_reports.append({"file": file_tag, "task": task, "prediction_rows": int(len(pred_df)), "fold_rows": int(len(fold_df)), "summary_rows": int(len(summary_df)), "path": str(out_book)})
-            print(f"[D LATE] saved {out_book}")
-        combined_df = _write_late_fusion_combined(task_summaries.get("cs", pd.DataFrame()), task_summaries.get("zone", pd.DataFrame()))
-        report_cs_summaries.append(task_summaries.get("cs", pd.DataFrame()))
-        report_zone_summaries.append(task_summaries.get("zone", pd.DataFrame()))
-        report_combo_summaries.append(combined_df)
+        merged["a_score_norm"] = merged.groupby("outer_fold")["y_score_a"].transform(_rank01)
+        merged["b_score_norm"] = merged.groupby("outer_fold")["y_score_b"].transform(_rank01)
+        merged["y_score"] = alpha * merged["a_score_norm"] + (1.0 - alpha) * merged["b_score_norm"]
+        merged["y_pred"] = (merged["y_score"] >= _fixed_threshold(task)).astype(int)
 
-    _write_late_fusion_top10_report(report_txt, alpha_grid, report_cs_summaries, report_zone_summaries, report_combo_summaries)
-    return all_reports
+        for outer_fold, fold in merged.groupby("outer_fold", sort=True):
+            outer_fold = int(outer_fold)
+            fusion_metrics = _metrics(fold["y_true"], fold["y_score"], fold["y_pred"])
+            fold_rows.append({
+                "task": task,
+                "outer_fold": outer_fold,
+                "meta_method": "equal_score_fusion",
+                "alpha": alpha,
+                "alpha_source": "A_Patch",
+                "n_candidates_used": 2,
+                "n_test": int(len(fold)),
+                **fusion_metrics,
+            })
+            method_rows.append({
+                "task": task,
+                "outer_fold": outer_fold,
+                "meta_method": "equal_score_fusion",
+                "complexity": 1,
+                "n_meta_features": 2,
+                "alpha": alpha,
+                **{f"outer_{key}": value for key, value in fusion_metrics.items()},
+            })
+            for rank, (source, score_col) in enumerate(
+                (("A_Patch", "a_score_norm"), ("B_Organ", "b_score_norm")), start=1
+            ):
+                source_metrics = _metrics(
+                    fold["y_true"], fold[score_col], (fold[score_col] >= _fixed_threshold(task)).astype(int)
+                )
+                selected_rows.append({
+                    "source": source,
+                    "task": task,
+                    "outer_fold": outer_fold,
+                    "candidate_rank": rank,
+                    "candidate_id": f"{source}::{task}::{outer_fold}::final_score",
+                    "status": "used",
+                    "score_source": "final_prediction_score",
+                    "fusion_weight": alpha if source == "A_Patch" else 1.0 - alpha,
+                })
+                base_outer_rows.append({
+                    "source": source,
+                    "task": task,
+                    "outer_fold": outer_fold,
+                    "candidate_rank": rank,
+                    "candidate_id": f"{source}::{task}::{outer_fold}::final_score",
+                    "n_test": int(len(fold)),
+                    **{f"outer_{key}": value for key, value in source_metrics.items()},
+                })
+
+            pred_rows.extend({
+                "task": task,
+                "outer_fold": outer_fold,
+                ID_COL: str(row[ID_COL]),
+                "y_true": int(row["y_true"]),
+                "y_score": float(row["y_score"]),
+                "y_pred": int(row["y_pred"]),
+                "meta_method": "equal_score_fusion",
+                "alpha": alpha,
+                "alpha_source": "A_Patch",
+                "a_score": float(row["y_score_a"]),
+                "b_score": float(row["y_score_b"]),
+                "a_score_norm": float(row["a_score_norm"]),
+                "b_score_norm": float(row["b_score_norm"]),
+            } for _, row in fold.iterrows())
+
+    pooled_df, mean_outer_df = f_stack.build_overall_summary(fold_rows, pred_rows)
+    sheets = {
+        "mean_outer": mean_outer_df,
+        "pooled": pooled_df,
+        "meta_fold_metrics": pd.DataFrame(fold_rows),
+        "selected_candidates": pd.DataFrame(selected_rows),
+        "meta_predictions": pd.DataFrame(pred_rows),
+        "base_oof_metrics": pd.DataFrame(),
+        "base_outer_metrics": pd.DataFrame(base_outer_rows),
+        "meta_method_perf": pd.DataFrame(method_rows),
+    }
+    out_path = late_results_dir / "final_stacking.xlsx"
+    f_stack.write_stacking_workbook(
+        str(out_path), {name: cfg.round_metrics(frame) for name, frame in sheets.items()}
+    )
+    print(f"[D LATE] saved final-score fusion with alpha(A_Patch)={alpha}: {out_path}")
+    return [{"task": task, "alpha": alpha, "path": str(out_path)} for task in CLASSICAL_TASKS]
 
 
-def run_late_fusion_for_seed(seed: int, alpha_grid: list[float]) -> None:
+def run_late_fusion_for_seed(seed: int) -> None:
     rd = results_dirs_for_seed(seed)
-    compute_late_fusion(alpha_grid, rd["organ"], rd["patch"], rd["late_fusion"])
+    compute_late_fusion(rd["patch"], rd["organ"], rd["late_fusion"])
 
 
 def main() -> None:
@@ -322,15 +289,13 @@ def main() -> None:
                     "predictions (per seed) into D_Late results."
     )
     parser.add_argument("--stage", choices=["early", "late"], required=True)
-    parser.add_argument("--seed", type=int, default=RANDOM_SEEDS[0])
-    parser.add_argument("--alpha-grid", default=cfg.DEFAULT_LATE_FUSION_ALPHA_GRID)
+    parser.add_argument("--seed", type=int, default=RANDOM_STATE)
     args = parser.parse_args()
 
     if args.stage == "early":
         build_early_fusion_workbooks()
     else:
-        alpha_grid = [float(x) for x in str(args.alpha_grid).split(",") if str(x).strip()]
-        run_late_fusion_for_seed(args.seed, alpha_grid)
+        run_late_fusion_for_seed(args.seed)
 
 
 if __name__ == "__main__":

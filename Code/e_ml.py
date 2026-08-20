@@ -18,6 +18,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 import all_config as _acfg
 from all_config import (
+    CLASSICAL_TASKS,
     FEATURE_FILES,
     ML_CLASSIFIERS,
     ML_FEATURE_SELECTORS,
@@ -31,11 +32,8 @@ import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import RobustScaler, StandardScaler
-from sklearn.feature_selection import f_classif
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
-from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.metrics import (
     roc_auc_score,
@@ -69,6 +67,7 @@ CONFIG = {
 
     "enabled_feature_selectors": list(ML_FEATURE_SELECTORS),
     "enabled_models": list(ML_CLASSIFIERS),
+    "tasks": list(CLASSICAL_TASKS),
 
     "fs_k_grid": [10,15,20,30],
     "fs_l1_C_grid": [0.05, 0.1, 0.5, 1.0],
@@ -77,8 +76,6 @@ CONFIG = {
 
     "model_grids": {
         "logreg": {"C": [0.1, 0.3, 1.0, 3.0]},
-        "linear_svm": {"C": [0.1, 0.3, 1.0, 3.0]},
-        "gaussian_nb": {"var_smoothing": [1e-9, 1e-8, 1e-7]},
         "lda": {"shrinkage": ["auto", 0.2, 0.5]},
     },
 
@@ -161,12 +158,14 @@ def sort_output_df(df: pd.DataFrame, kind: str, final_combo_sort: bool = False) 
         return df
 
     if kind == "combo_summary" and final_combo_sort:
-        metric_col = "auc_mean" if "auc_mean" in df.columns else "auc"
-        sort_cols = [metric_col]
-        ascending = [False]
+        metric_col = next((col for col in ("auc_mean", "auc") if col in df.columns), None)
+        sort_cols = [metric_col] if metric_col is not None else []
+        ascending = [False] if metric_col is not None else []
         tie_cols = [c for c in ["file", "fs_method", "clf_model"] if c in df.columns]
         sort_cols.extend(tie_cols)
         ascending.extend([True] * len(tie_cols))
+        if not sort_cols:
+            return df
         return df.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
 
     order_map = {
@@ -510,16 +509,7 @@ def select_features(
             selector_cache[cache_key] = (order, scores_all)
         return order, scores_all
 
-    if method == "none":
-        idx = list(range(n_feat))
-        names = list(feature_names)
-        scores = [1.0] * n_feat
-    elif method == "anova_f":
-        order, f_vals = cached_ranking(("anova_f",), lambda: f_classif(X_train, y_train)[0])
-        idx = order[:k]
-        names = [feature_names[i] for i in idx]
-        scores = [float(f_vals[i]) for i in idx]
-    elif method == "l1_embedded":
+    if method == "l1_embedded":
         C = float(params.get("l1_C", 0.1))
         order, coef = cached_ranking(
             ("l1_embedded", C),
@@ -540,13 +530,7 @@ def select_features(
 
 
 def build_selector_param_grid(fs_method: str, config: Dict, n_base_features: int) -> List[Dict[str, Any]]:
-    if fs_method == "none":
-        return [{}]
-
     k_valid = sorted({int(k) for k in config["fs_k_grid"] if 1 <= int(k) <= n_base_features})
-
-    if fs_method == "anova_f":
-        return [{"k": k} for k in k_valid]
 
     if fs_method == "l1_embedded":
         out = []
@@ -571,15 +555,6 @@ def make_estimator(model_key: str, params: Dict[str, Any], task_name: str, confi
             tol=config["tol"],
             random_state=config["random_state"],
         )
-    if model_key == "linear_svm":
-        return LinearSVC(
-            C=float(params["C"]),
-            class_weight=class_weight,
-            max_iter=config["max_iter"],
-            random_state=config["random_state"],
-        )
-    if model_key == "gaussian_nb":
-        return GaussianNB(var_smoothing=float(params["var_smoothing"]))
     if model_key == "lda":
         return LinearDiscriminantAnalysis(solver="lsqr", shrinkage=params["shrinkage"])
 
@@ -606,6 +581,14 @@ def get_scores_and_preds(clf, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, st
     return pred.astype(float), pred.astype(int), "predict"
 
 
+def fixed_threshold(task_name: str) -> float:
+    return 0.45 if str(task_name).lower() == "zone" else 0.5
+
+
+def score_to_pred(score: np.ndarray, task_name: str) -> np.ndarray:
+    return (np.asarray(score, dtype=float) >= fixed_threshold(task_name)).astype(int)
+
+
 def compute_metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     if len(np.unique(y_true)) >= 2:
         auc = float(roc_auc_score(y_true, y_score))
@@ -628,13 +611,13 @@ def compute_metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndarray)
     spec = float(tn / (tn + fp)) if (tn + fp) > 0 else np.nan
 
     return {
-        "auc": round(auc, 4),
-        "ap": round(ap, 4),
-        "balanced_acc": round(bal, 4),
-        "f1": round(f1, 4),
-        "accuracy": round(acc, 4),
-        "sensitivity": round(sens, 4),
-        "specificity": round(spec, 4),
+        "auc": auc,
+        "ap": ap,
+        "balanced_acc": bal,
+        "f1": f1,
+        "accuracy": acc,
+        "sensitivity": sens,
+        "specificity": spec,
     }
 
 
@@ -694,9 +677,9 @@ def choose_best_params(
             best_rank = rank
             best_key = key
             best_stats = {
-                "inner_mean_auc": round(mean_auc, 4),
-                "inner_mean_ap": round(mean_ap, 4),
-                "inner_std_auc": round(std_auc, 4),
+                "inner_mean_auc": mean_auc,
+                "inner_mean_ap": mean_ap,
+                "inner_std_auc": std_auc,
                 "inner_scores_used": int(len(aucs)),
             }
 
@@ -724,7 +707,7 @@ def apply_optional_pca(
         Xap_p,
         pca,
         int(getattr(pca, "n_components_", Xtr_p.shape[1])),
-        round(float(np.sum(pca.explained_variance_ratio_)), 4),
+        float(np.sum(pca.explained_variance_ratio_)),
     )
 
 
@@ -936,8 +919,8 @@ def run_inner_search_combo(
                         "clf_model": clf_model,
                         "clf_params": params_to_json(model_params),
                         "score_source": score_source,
-                        "auc": round(auc, 4),
-                        "ap": round(ap, 4),
+                        "auc": auc,
+                        "ap": ap,
                         "n_base_features": int(Xtr_base.shape[1]),
                         "n_after_quasi": prep.stats.get("n_after_quasi", np.nan),
                         "n_after_corr": prep.stats.get("n_after_corr", np.nan),
@@ -950,7 +933,7 @@ def run_inner_search_combo(
         context=context,
     )
     return best_params, pd.DataFrame(rows)
-    
+
 def evaluate_outer_fold_combo(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -1020,7 +1003,8 @@ def evaluate_outer_fold_combo(
 
     clf = make_estimator(clf_model, clf_params, task_name, config)
     clf.fit(Xtr_final, ytr)
-    y_score, y_pred, score_source = get_scores_and_preds(clf, Xte_final)
+    y_score, _y_pred, score_source = get_scores_and_preds(clf, Xte_final)
+    y_pred = score_to_pred(y_score, task_name)
     mets = compute_metrics(yte, y_score, y_pred)
 
     fold_row = {
@@ -1060,12 +1044,10 @@ def evaluate_outer_fold_combo(
         "score": sel_scores,
         "selected_k": len(sel_names),
     }).sort_values(["score", "rank"], ascending=[False, True]).reset_index(drop=True)
-    feat_df["score"] = feat_df["score"].round(4)
-
     pred_df = pd.DataFrame({
         "case_id": test_df["case_id"].astype(str).values,
         "y_true": yte,
-        "y_score": np.round(y_score, 4),
+        "y_score": y_score,
         "y_pred": y_pred,
     })
 
@@ -1114,12 +1096,6 @@ def summarize_combo_metrics(
     out["mean_n_selected"] = float(pd.to_numeric(df_fold["n_selected"], errors="coerce").mean())
     out["mean_pca_components"] = float(pd.to_numeric(df_fold["pca_components"], errors="coerce").mean())
 
-    for key in (
-        [f"{m}_mean" for m in metrics] + [f"{m}_std" for m in metrics]
-        + ["stability_index_auc", "mean_n_after_corr", "mean_n_selected", "mean_pca_components"]
-    ):
-        out[key] = round(out[key], 4)
-
     return pd.DataFrame([out])
 
 
@@ -1140,8 +1116,6 @@ def aggregate_selected_features(
         mean_score=("score", "mean"),
         mean_rank=("rank", "mean"),
     )
-    g["mean_score"] = g["mean_score"].round(4)
-    g["mean_rank"] = g["mean_rank"].round(4)
     g["file"] = file_tag
     g["fs_method"] = fs_method
     g["clf_model"] = clf_model
@@ -1164,13 +1138,13 @@ def build_task_workbooks(task_store: Dict[str, List[Dict]], file_out_dir: str, f
     pred_df = sort_output_df(pd.DataFrame(task_store["pred_rows"]), "pred_rows")
 
     write_workbook(analysis_book, {
-        "combo_summary": _acfg.collapse_mean_std_columns(_acfg.round_metrics(summary_df)),
-        "fold_metrics": _acfg.round_metrics(fold_df),
-        "inner_perf": _acfg.round_metrics(inner_df),
-        "selected_features": _acfg.round_metrics(sel_df),
-        "agg_feat_rank": _acfg.round_metrics(agg_df),
+        "combo_summary": _acfg.collapse_mean_std_columns(summary_df),
+        "fold_metrics": fold_df,
+        "inner_perf": inner_df,
+        "selected_features": sel_df,
+        "agg_feat_rank": agg_df,
     }, logger=logger)
-    _acfg.write_predictions(pred_df, pred_csv)
+    _acfg.write_table(pred_df, pred_csv)
 
 
 def build_minimal_task_summary(summary_df: pd.DataFrame, suffix: str) -> pd.DataFrame:
@@ -1255,7 +1229,10 @@ def build_combined_average_workbook(file_out_dir: str, file_tag: str, cs_summary
     zone_min = reorder_df_like_reference(zone_min, combo, key_cols)
 
     combo = _acfg.round_metrics(combo)
-    return combo[["file", "fs_method", "clf_model", "auc", "f1", "sensitivity", "specificity", "accuracy"]]
+    combo = combo[["file", "fs_method", "clf_model", "auc", "f1", "sensitivity", "specificity", "accuracy"]]
+    average_book = os.path.join(file_out_dir, f"results_average_{file_tag}.xlsx")
+    write_workbook(average_book, {"combo_summary": combo}, logger=logger)
+    return combo
 
 
 def filter_summary_to_active_grid(summary_df: pd.DataFrame, config: Dict) -> pd.DataFrame:
@@ -1641,6 +1618,7 @@ def validate_feature_workbook_coverage_for_stacking(
     if not outer_splits:
         raise RuntimeError("coverage_check_failed_missing_outer_splits")
     label_maps = _load_reference_label_maps_for_verify(logger)
+    tasks = tuple(config.get("tasks") or CLASSICAL_TASKS)
 
     try:
         df = _acfg.read_table(file_path, id_col=config["id_col"])
@@ -1651,7 +1629,7 @@ def validate_feature_workbook_coverage_for_stacking(
     got_ids = {cid for cid in (_clean_case_id_for_verify(x) for x in df[config["id_col"]].tolist()) if cid is not None}
     for outer in outer_splits:
         outer_fold = int(outer.get("outer_fold", -1))
-        for task in ("cs", "zone"):
+        for task in tasks:
             expected_train, expected_eval, expected_all_test = _expected_ids_for_outer_for_verify(outer, task, label_maps)
             for part_name, expected_ids in (
                 ("train", expected_train),
@@ -1687,6 +1665,7 @@ def run_pipeline(config: Dict):
     report_cs_summaries = []
     report_zone_summaries = []
     report_combo_summaries = []
+    tasks = tuple(config.get("tasks") or CLASSICAL_TASKS)
 
     logger.info("Pipeline started")
 
@@ -1724,8 +1703,8 @@ def run_pipeline(config: Dict):
             ensure_dir(file_out_dir)
 
             task_results = {
-                "cs": load_existing_task_results(file_out_dir, file_tag, "cs", logger),
-                "zone": load_existing_task_results(file_out_dir, file_tag, "zone", logger),
+                task: load_existing_task_results(file_out_dir, file_tag, task, logger)
+                for task in tasks
             }
 
             df = read_feature_workbook(file_path)
@@ -1740,7 +1719,7 @@ def run_pipeline(config: Dict):
                 logger.warning(f"No features in {file_name}")
                 continue
 
-            for task_name in ["cs", "zone"]:
+            for task_name in tasks:
                 d_task = prepare_model_data(df, task_name, config)
                 if d_task.empty or d_task["y"].nunique() < 2:
                     logger.warning(f"Insufficient data/classes for {file_tag}:{task_name}")
@@ -1881,13 +1860,13 @@ def run_pipeline(config: Dict):
 
                         build_task_workbooks(task_results[task_name], file_out_dir, file_tag, task_name, logger=logger)
 
-            build_task_workbooks(task_results["cs"], file_out_dir, file_tag, "cs", logger=logger)
-            build_task_workbooks(task_results["zone"], file_out_dir, file_tag, "zone", logger=logger)
+            for task_name in tasks:
+                build_task_workbooks(task_results[task_name], file_out_dir, file_tag, task_name, logger=logger)
 
             expected_outer_folds = {int(x["outer_fold"]) for x in split_payload["outer_splits"]}
             incomplete = []
-            incomplete.extend(validate_task_store_complete(task_results["cs"], file_tag, "cs", config, expected_outer_folds))
-            incomplete.extend(validate_task_store_complete(task_results["zone"], file_tag, "zone", config, expected_outer_folds))
+            for task_name in tasks:
+                incomplete.extend(validate_task_store_complete(task_results[task_name], file_tag, task_name, config, expected_outer_folds))
             if incomplete:
                 msg = "Incomplete ML output after resume/build; refusing to write final report as complete. Examples: " + " | ".join(incomplete[:12])
                 logger.error(msg)
@@ -1895,12 +1874,21 @@ def run_pipeline(config: Dict):
                 shutil.rmtree(file_out_dir, ignore_errors=True)
                 raise RuntimeError(msg)
 
-            cs_summary_full = sort_output_df(pd.DataFrame(task_results["cs"]["summary_rows"]), "combo_summary", final_combo_sort=True)
-            zone_summary_full = sort_output_df(pd.DataFrame(task_results["zone"]["summary_rows"]), "combo_summary", final_combo_sort=True)
-            combo_summary_full = build_combined_average_workbook(file_out_dir, file_tag, cs_summary_full, zone_summary_full, logger=logger)
-            report_cs_summaries.append(filter_summary_to_active_grid(cs_summary_full, config))
-            report_zone_summaries.append(filter_summary_to_active_grid(zone_summary_full, config))
-            report_combo_summaries.append(filter_summary_to_active_grid(combo_summary_full, config))
+            cs_summary_full = pd.DataFrame()
+            if "cs" in task_results:
+                cs_summary_full = sort_output_df(pd.DataFrame(task_results["cs"]["summary_rows"]), "combo_summary", final_combo_sort=True)
+                report_cs_summaries.append(filter_summary_to_active_grid(cs_summary_full, config))
+            if "zone" in task_results:
+                zone_summary_full = sort_output_df(pd.DataFrame(task_results["zone"]["summary_rows"]), "combo_summary", final_combo_sort=True)
+                report_zone_summaries.append(filter_summary_to_active_grid(zone_summary_full, config))
+                combo_summary = build_combined_average_workbook(
+                    file_out_dir=file_out_dir,
+                    file_tag=file_tag,
+                    cs_summary_full=cs_summary_full,
+                    zone_summary_full=zone_summary_full,
+                    logger=logger,
+                )
+                report_combo_summaries.append(filter_summary_to_active_grid(combo_summary, config))
             logger.info(f"Completed file: {file_tag}")
 
         except Exception as e:
@@ -1947,7 +1935,7 @@ from all_config import (
 def _ml_profile_for_base_dir(base_dir: Path) -> dict:
     # All experiments (A_Patch, B_Organ, B_Organ_same, C_Early) train on the same
     # feature files / feature selectors / classifiers grid; base_dir is unused but
-    # kept so g_train.py can call this the same way regardless of workbook type.
+    # kept so h_train.py can call this the same way regardless of workbook type.
     return {
         "feature_files": list(FEATURE_FILES),
         "feature_selectors": list(ML_FEATURE_SELECTORS),
@@ -1961,6 +1949,7 @@ def _run_one_ml(
     seed: int,
     json_path: str | None,
     experiment_name: str | None = None,
+    tasks: tuple[str, ...] | None = None,
 ) -> None:
     profile = _ml_profile_for_base_dir(base_dir)
     feature_files = list(profile["feature_files"])
@@ -1979,6 +1968,7 @@ def _run_one_ml(
     cfg["enabled_feature_selectors"] = list(profile["feature_selectors"])
     cfg["enabled_models"] = list(profile["classifiers"])
     cfg["experiment_name"] = experiment_name
+    cfg["tasks"] = list(tasks or CLASSICAL_TASKS)
 
     if json_path:
         cfg["json_path"] = str(Path(json_path))
@@ -1994,7 +1984,7 @@ def main() -> None:
         description="Run nested-CV ML search on patch-helper-augmented main workbooks."
     )
     parser.add_argument("--only", default=_acfg.DEFAULT_INTERNAL_EXPERIMENTS, help="Comma-separated workbook-based experiments to run: A (A_Patch), B (B_Organ), C (C_Early), B0 (B_Organ_same). D (D_Late) is handled by d_fusion, not here.")
-    parser.add_argument("--seed", type=int, default=RANDOM_SEEDS[0])
+    parser.add_argument("--seed", type=int, default=RANDOM_STATE)
     parser.add_argument("--all-seeds", action="store_true", help="Run for all seeds in RANDOM_SEEDS sequentially.")
     parser.add_argument(
         "--json-path",
@@ -2004,6 +1994,7 @@ def main() -> None:
     parser.add_argument("--base-dir", default=None, help="Override workbook directory (used by z_main).")
     parser.add_argument("--results-dir-name", default=None, help="Override results directory (used by z_main).")
     parser.add_argument("--name", default=None, help="Experiment name for the completion log line (used by z_main).")
+    parser.add_argument("--tasks", default=None, help="Comma-separated tasks to run. Default follows the experiment: A=cs, B/B0/C=cs,zone.")
     args = parser.parse_args()
 
     if args.base_dir is not None and args.results_dir_name is not None:
@@ -2013,6 +2004,7 @@ def main() -> None:
             seed=args.seed,
             json_path=args.json_path,
             experiment_name=args.name,
+            tasks=tuple(x.strip() for x in args.tasks.split(",") if x.strip()) if args.tasks else None,
         )
         return
 
@@ -2040,6 +2032,7 @@ def main() -> None:
                 seed=seed,
                 json_path=args.json_path,
                 experiment_name=experiment_names[part],
+                tasks=_acfg.classical_tasks_for_experiment(part),
             )
 
 

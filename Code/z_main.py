@@ -14,10 +14,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 import a_preprocess
 import d_fusion
+import g_maxPool
 
 from all_config import (
     COMPLETION_MARKER,
-    DEFAULT_LATE_FUSION_ALPHA_GRID,
+    LATE_FUSION_ALPHA,
     DEFAULT_PIPELINE_EXPERIMENTS,
     DEFAULT_STACKING_TOP_K,
     EARLY_FUSION_RESULTS_DIR,
@@ -40,9 +41,11 @@ from all_config import (
     external_results_dir as _external_results_dir,
     final_model_path as _final_model_path,
     RANDOM_SEEDS,
+    RANDOM_STATE,
     DATASET_XLSX,
     ID_COL,
     CLIN_COL,
+    CLASSICAL_TASKS,
     ZONE_COL,
     results_dir as _results_dir,
     split_json_name as _split_json_name,
@@ -69,13 +72,20 @@ def _split_json_for_experiment(exp_key: str, seed: int) -> Path:
     return _results_dir(exp_key, seed) / _split_json_name(seed)
 
 
+def _tasks_for_experiment(exp_key: str) -> tuple[str, ...]:
+    import all_config as _acfg
+    return _acfg.classical_tasks_for_experiment(exp_key)
+
+
 def _final_model_paths_for_seed(seed: int, exp_keys: list[str]) -> list[Path]:
     paths: list[Path] = []
     for exp_key in exp_keys:
-        if exp_key not in {"A", "B", "C"}:
+        if exp_key not in {"A", "B", "B0", "C"}:
             continue
-        for task in ("cs", "zone"):
+        for task in _tasks_for_experiment(exp_key):
             paths.append(_final_model_path(exp_key, task, seed))
+        if exp_key == "A":
+            paths.append(g_maxPool.model_path(seed))
     return paths
 
 
@@ -235,8 +245,10 @@ def _assert_inner_oof_split_coverage_complete(
     outer_splits: list[dict],
     label_maps: dict[str, dict[str, object]],
     expected_folds: set[int],
+    tasks: tuple[str, ...] | None = None,
 ) -> None:
     errors: list[str] = []
+    tasks = tuple(tasks or CLASSICAL_TASKS)
     for outer in outer_splits:
         outer_fold = int(outer.get("outer_fold", -1))
         if outer_fold not in expected_folds:
@@ -256,7 +268,7 @@ def _assert_inner_oof_split_coverage_complete(
                 f"outer={outer_fold} inner validation has {len(extra_inner)} IDs outside outer train; "
                 f"examples={extra_inner[:8]}"
             )
-        for task in ("cs", "zone"):
+        for task in tasks:
             task_map = label_maps.get(task, {})
             expected_train = {cid for cid in outer_train_all if cid in task_map}
             covered_train = {cid for cid in inner_val_union if cid in task_map}
@@ -294,6 +306,7 @@ def _stacking_feature_coverage_complete(
     file_names: list[str],
     expected_outer_folds: set[int] | None = None,
     split_json_path: Path | None = None,
+    tasks: tuple[str, ...] | None = None,
 ) -> bool:
     outer_splits = _load_outer_splits(split_json_path)
     label_maps = _load_reference_label_maps()
@@ -318,7 +331,7 @@ def _stacking_feature_coverage_complete(
             return False
         for outer_fold in sorted(expected_folds):
             outer = split_by_fold[outer_fold]
-            for task in ("cs", "zone"):
+            for task in tuple(tasks or CLASSICAL_TASKS):
                 expected_train, expected_eval, expected_all_test = _expected_ids_for_outer(outer, task, label_maps)
                 checks = [
                     ("train", expected_train),
@@ -356,7 +369,7 @@ def _prediction_rows_cover_expected_cases(
     return int(dup) == 0
 
 
-def _report_is_complete(report_path: Path) -> bool:
+def _report_is_complete(report_path: Path, tasks: tuple[str, ...] | None = None) -> bool:
     if not report_path.exists():
         print(f"[CACHE] missing final report: {report_path}")
         return False
@@ -367,7 +380,8 @@ def _report_is_complete(report_path: Path) -> bool:
     if "[ERROR]" in text or "Traceback" in text:
         print(f"[CACHE] final report contains errors: {report_path}")
         return False
-    required_sections = ["[CS summary]", "[ZONE summary]", "[CS/ZONE average summary]"]
+    active_tasks = tuple(tasks or CLASSICAL_TASKS)
+    required_sections = [f"[{task.upper()} summary]" for task in active_tasks]
     if not all(section in text for section in required_sections):
         print(f"[CACHE] final report missing required sections: {report_path}")
         return False
@@ -385,10 +399,11 @@ def _active_ml_grid_complete(
     expected_outer_folds: set[int] | None = None,
     workbook_dir: Path | None = None,
     split_json_path: Path | None = None,
+    tasks: tuple[str, ...] | None = None,
 ) -> bool:
     if not results_dir.exists():
         return False
-    if not _report_is_complete(results_dir / FINAL_REPORT_NAME):
+    if not _report_is_complete(results_dir / FINAL_REPORT_NAME, tasks=tasks):
         return False
 
     expected_folds = set(expected_outer_folds or _expected_outer_folds(split_json_path))
@@ -399,17 +414,17 @@ def _active_ml_grid_complete(
     if not outer_splits or not label_maps.get("cs") or not label_maps.get("y3"):
         print(f"[CACHE] cannot verify case-level ML prediction coverage for {results_dir}")
         return False
-    _assert_inner_oof_split_coverage_complete(outer_splits, label_maps, expected_folds)
+    _assert_inner_oof_split_coverage_complete(outer_splits, label_maps, expected_folds, tasks=tasks)
 
     for outer in outer_splits:
         outer_fold = int(outer.get("outer_fold", -1))
         if outer_fold not in expected_folds:
             continue
-        for task in ("cs", "zone"):
+        for task in tuple(tasks or CLASSICAL_TASKS):
             _, expected_eval, _ = _expected_ids_for_outer(outer, task, label_maps)
             expected_ids_by_task_outer[(task, outer_fold)] = expected_eval
 
-    if workbook_dir is not None and not _stacking_feature_coverage_complete(workbook_dir, file_names, expected_folds, split_json_path):
+    if workbook_dir is not None and not _stacking_feature_coverage_complete(workbook_dir, file_names, expected_folds, split_json_path, tasks=tasks):
         return False
 
     expected = {
@@ -428,13 +443,11 @@ def _active_ml_grid_complete(
         required_files = [
             file_dir / f"results_cs_{file_tag}.xlsx",
             file_dir / f"predictions_cs_{file_tag}.csv",
-            file_dir / f"results_zone_{file_tag}.xlsx",
-            file_dir / f"predictions_zone_{file_tag}.csv",
         ]
         if any(not path.exists() for path in required_files):
             return False
 
-        for task in ("cs", "zone"):
+        for task in tuple(tasks or CLASSICAL_TASKS):
             result_path = file_dir / f"results_{task}_{file_tag}.xlsx"
             pred_path = file_dir / f"predictions_{task}_{file_tag}.csv"
             try:
@@ -504,6 +517,7 @@ def ml_result_ready(
     expected_outer_folds: set[int] | None = None,
     workbook_dir: Path | None = None,
     split_json_path: Path | None = None,
+    tasks: tuple[str, ...] | None = None,
 ) -> bool:
     if _active_ml_grid_complete(
         results_dir,
@@ -513,6 +527,7 @@ def ml_result_ready(
         expected_outer_folds,
         workbook_dir=workbook_dir,
         split_json_path=split_json_path,
+        tasks=tasks,
     ):
         print(f"[CACHE] {name} active ML grid complete and verified for stacking: {results_dir}")
         if not completion_logged(results_dir, name):
@@ -523,70 +538,15 @@ def ml_result_ready(
     return False
 
 
-def late_fusion_files_complete(
-    results_dir: Path,
-    file_names: list[str],
-    feature_selectors: list[str],
-    classifiers: list[str],
-    alpha_grid: list[float],
-) -> bool:
-    if not results_dir.exists():
-        return False
-    expected = {
-        (str(fs_method), str(clf_model), float(alpha))
-        for fs_method in feature_selectors
-        for clf_model in classifiers
-        for alpha in alpha_grid
-    }
-    if not expected:
-        return False
-
-    for file_tag in _file_tags(file_names):
-        file_dir = results_dir / file_tag
-        required_files = [
-            file_dir / f"results_cs_{file_tag}.xlsx",
-            file_dir / f"results_zone_{file_tag}.xlsx",
-        ]
-        if not all(path.exists() for path in required_files):
-            return False
-        for task in ("cs", "zone"):
-            try:
-                summary = pd.read_excel(file_dir / f"results_{task}_{file_tag}.xlsx", sheet_name="combo_summary")
-            except Exception:
-                return False
-            needed_cols = {"fs_method", "clf_model", "alpha"}
-            if summary.empty or not needed_cols.issubset(summary.columns):
-                return False
-            got = {
-                (str(row["fs_method"]), str(row["clf_model"]), float(row["alpha"]))
-                for _, row in summary.iterrows()
-            }
-            missing = expected - got
-            if missing:
-                sample = sorted(missing)[:5]
-                print(
-                    f"[CACHE] D_Late/{file_tag}/{task} missing active fusion combos; "
-                    f"examples: {sample}"
-                )
-                return False
-    return (results_dir / FINAL_REPORT_NAME).exists()
-
-
-def late_fusion_ready(alpha_grid: list[float]) -> bool:
+def late_fusion_ready() -> bool:
     name = "D_Late"
-    if late_fusion_files_complete(
-        LATE_FUSION_RESULTS_DIR,
-        list(FEATURE_FILES),
-        list(ML_FEATURE_SELECTORS),
-        list(ML_CLASSIFIERS),
-        alpha_grid,
-    ):
-        print(f"[CACHE] D_Late active fusion grid complete: {LATE_FUSION_RESULTS_DIR}")
+    if stacking_ready("D"):
+        print(f"[CACHE] D_Late final-score fusion complete: {LATE_FUSION_RESULTS_DIR}")
         if not completion_logged(LATE_FUSION_RESULTS_DIR, name):
             mark_complete(LATE_FUSION_RESULTS_DIR, name)
         return True
     if completion_logged(LATE_FUSION_RESULTS_DIR, name):
-        print("[RESUME] D_Late completion marker exists, but active config has missing combos; rerunning late fusion")
+        print("[RESUME] D_Late completion marker exists, but current final-score fusion is missing; rerunning")
     return False
 
 
@@ -600,7 +560,7 @@ def patch_workbooks_ready() -> bool:
         return False
     import b_patch
     try:
-        return b_patch._all_final_patch_workbooks_exist()
+        return b_patch._all_final_patch_workbooks_exist() and b_patch._all_maxpool_detection_caches_exist()
     except FileNotFoundError:
         return True
 
@@ -699,6 +659,7 @@ def run_ml_experiment(
     seed: int,
     split_json_path: Path | None = None,
     feature_files: list[str] | None = None,
+    tasks: tuple[str, ...] | None = None,
 ) -> bool:
     if feature_files is not None:
         expected_folds = _expected_outer_folds(split_json_path, default=4)
@@ -711,6 +672,7 @@ def run_ml_experiment(
             expected_outer_folds=expected_folds,
             workbook_dir=workbook_dir,
             split_json_path=split_json_path,
+            tasks=tasks,
         ):
             return False
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -728,34 +690,28 @@ def run_ml_experiment(
     ]
     if split_json_path is not None:
         cmd.extend(["--json-path", str(split_json_path)])
+    if tasks is not None:
+        cmd.extend(["--tasks", ",".join(tasks)])
     run_cmd(cmd)
     return True
 
 
-def run_late_fusion(alpha_grid: list[float], force: bool = False) -> bool:
+def run_late_fusion(force: bool = False) -> bool:
     name = "D_Late"
     migrate_legacy_done_marker(LATE_FUSION_RESULTS_DIR, name)
-    if not force and late_fusion_ready(alpha_grid):
+    if not force and late_fusion_ready():
         print(f"[CACHE] D late-fusion results already complete: {LATE_FUSION_RESULTS_DIR}")
         return False
     LATE_FUSION_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     log_line(LATE_FUSION_RESULTS_DIR, "D late-fusion pipeline started")
     reports = d_fusion.compute_late_fusion(
-        alpha_grid, ORGAN_ONLY_RESULTS_DIR, PATCH_ONLY_RESULTS_DIR, LATE_FUSION_RESULTS_DIR
+        PATCH_ONLY_RESULTS_DIR,
+        ORGAN_ONLY_RESULTS_DIR,
+        LATE_FUSION_RESULTS_DIR,
     )
     log_line(LATE_FUSION_RESULTS_DIR, f"D late-fusion wrote {len(reports)} task result workbooks")
     mark_complete(LATE_FUSION_RESULTS_DIR, name)
     return True
-
-
-def parse_alpha_grid(raw: str) -> list[float]:
-    vals = [float(x.strip()) for x in raw.split(",") if x.strip()]
-    if not vals:
-        raise ValueError("alpha grid cannot be empty")
-    for val in vals:
-        if val < 0.0 or val > 1.0:
-            raise ValueError("alpha values must be in [0, 1]")
-    return vals
 
 
 def _result_dir_for_experiment(experiment_key: str) -> Path:
@@ -804,7 +760,7 @@ def stacking_ready(experiment_key: str, split_json_path: Path | None = None) -> 
         return False
 
     expected_folds = _expected_outer_folds(split_json_path, default=4)
-    expected_pairs = {(task, fold) for task in ("cs", "zone") for fold in expected_folds}
+    expected_pairs = {(task, fold) for task in _tasks_for_experiment(experiment_key) for fold in expected_folds}
     got_pairs = {
         (str(row["task"]), int(row["outer_fold"]))
         for _, row in fold_df.iterrows()
@@ -814,6 +770,23 @@ def stacking_ready(experiment_key: str, split_json_path: Path | None = None) -> 
     if missing_pairs:
         print(f"[CACHE] {experiment_key} stacking workbook missing task/fold rows; examples: {sorted(missing_pairs)[:5]}")
         return False
+
+    if experiment_key == "D":
+        if "source" not in sel_df.columns or "meta_method" not in fold_df.columns:
+            print("[CACHE] D stacking workbook missing fusion provenance; rerunning stacking")
+            return False
+        sources = set(sel_df["source"].dropna().astype(str))
+        methods = set(fold_df["meta_method"].dropna().astype(str))
+        alphas = set(pd.to_numeric(fold_df.get("alpha", pd.Series(dtype=float)), errors="coerce").dropna().round(8))
+        alpha_sources = set(fold_df.get("alpha_source", pd.Series(dtype=str)).dropna().astype(str))
+        if (
+            sources != {"A_Patch", "B_Organ"}
+            or methods != {"equal_score_fusion"}
+            or alphas != {round(LATE_FUSION_ALPHA, 8)}
+            or alpha_sources != {"A_Patch"}
+        ):
+            print("[CACHE] D output does not match the configured final A/B score fusion; rerunning")
+            return False
 
     return True
 
@@ -879,23 +852,107 @@ def _ordered_experiments(raw: str | None, fallback: set[str]) -> list[str]:
 
 def external_data_available() -> bool:
     # Checks raw input, not the preprocessed output folder - preprocessing itself
-    # happens lazily inside h_test.py's own startup, not here.
+    # happens lazily inside i_test.py's own startup, not here.
     return Path(TEST_ROOT / "original").exists() and Path(P158_DATASET_XLSX).exists()
 
 
 def _final_models_ready_for_external(seed: int, exp_keys: list[str]) -> bool:
-    return all_exist(_final_model_paths_for_seed(seed, exp_keys))
+    if not all_exist(_final_model_paths_for_seed(seed, exp_keys)):
+        return False
+    import joblib
+    for exp_key in exp_keys:
+        if exp_key not in {"A", "B", "B0", "C"}:
+            continue
+        for task in _tasks_for_experiment(exp_key):
+            try:
+                bundle = joblib.load(_final_model_path(exp_key, task, seed))
+            except Exception:
+                return False
+            config = bundle.get("config", {})
+            expected_combos = {
+                (file_tag, fs_method, clf_model)
+                for file_tag in _file_tags(list(FEATURE_FILES))
+                for fs_method in ML_FEATURE_SELECTORS
+                for clf_model in ML_CLASSIFIERS
+            }
+            fitted_combos = {
+                (
+                    str(result.get("candidate", {}).get("file")),
+                    str(result.get("candidate", {}).get("fs_method")),
+                    str(result.get("candidate", {}).get("clf_model")),
+                )
+                for result in bundle.get("candidate_results", [])
+            }
+            if (
+                list(bundle.get("feature_files", [])) != list(FEATURE_FILES)
+                or list(config.get("enabled_feature_selectors", [])) != list(ML_FEATURE_SELECTORS)
+                or list(config.get("enabled_models", [])) != list(ML_CLASSIFIERS)
+                or fitted_combos != expected_combos
+            ):
+                return False
+    return True
 
 
 def _external_results_ready(seed: int, exp_keys: list[str]) -> bool:
-    return all_exist(_external_result_paths_for_seed(seed, exp_keys))
+    for exp_key in exp_keys:
+        path = _external_results_dir(exp_key) / f"ext_results_seed{seed}.xlsx"
+        if not path.exists():
+            return False
+        try:
+            sheet = "late_fusion_metrics" if exp_key == "D" else "metrics"
+            metrics = pd.read_excel(path, sheet_name=sheet)
+        except Exception:
+            return False
+        tasks = set(metrics.get("task", pd.Series(dtype=str)).astype(str))
+        if not set(_tasks_for_experiment(exp_key)).issubset(tasks):
+            return False
+        if exp_key in {"A", "B", "B0", "C"}:
+            try:
+                individual = pd.read_excel(path, sheet_name="individual_metrics")
+            except Exception:
+                return False
+            classical_tasks = set(_tasks_for_experiment(exp_key))
+            classical = individual[individual["task"].astype(str).isin(classical_tasks)]
+            expected_combos = {
+                (task, file_tag, fs_method, clf_model)
+                for task in classical_tasks
+                for file_tag in _file_tags(list(FEATURE_FILES))
+                for fs_method in ML_FEATURE_SELECTORS
+                for clf_model in ML_CLASSIFIERS
+            }
+            got_combos = {
+                (str(row["task"]), str(row["file"]), str(row["fs_method"]), str(row["clf_model"]))
+                for _, row in classical.iterrows()
+                if all(pd.notna(row.get(col)) for col in ("task", "file", "fs_method", "clf_model"))
+            }
+            if got_combos != expected_combos:
+                return False
+        if exp_key == "A":
+            zone = metrics[metrics["task"].astype(str) == "zone"] if "task" in metrics else pd.DataFrame()
+            if "head" not in zone:
+                return False
+            zone = zone[zone["head"].astype(str) == "maxpool"]
+            if zone.empty:
+                return False
+            try:
+                zone_predictions = pd.read_excel(path, sheet_name="zone_predictions")
+            except Exception:
+                return False
+            if zone_predictions.empty or set(zone_predictions.get("task", pd.Series(dtype=str)).astype(str)) != {"zone"}:
+                return False
+        if exp_key == "D":
+            alphas = set(pd.to_numeric(metrics.get("alpha", pd.Series(dtype=float)), errors="coerce").dropna().round(8))
+            alpha_sources = set(metrics.get("alpha_source", pd.Series(dtype=str)).dropna().astype(str))
+            if alphas != {round(LATE_FUSION_ALPHA, 8)} or alpha_sources != {"A_Patch"}:
+                return False
+    return True
 
 
 def run_external_test(
     args: argparse.Namespace,
     keys: list[str],
 ) -> bool:
-    test_keys = [e for e in keys if e in ("A", "B", "C", "D")]
+    test_keys = [e for e in keys if e in ("A", "B", "B0", "C", "D")]
     if not test_keys:
         return False
     if not external_data_available():
@@ -903,21 +960,25 @@ def run_external_test(
         return False
 
     if _external_results_ready(args.seed, test_keys):
-        print(f"[CACHE] external results already exist for {test_keys}; skipping g_train and h_test")
+        print(f"[CACHE] external results already exist for {test_keys}; skipping h_train and i_test")
         return False
 
-    model_keys = [e for e in test_keys if e != "D"]
+    execution_keys = list(test_keys)
+    if "D" in test_keys:
+        # D external fusion consumes B classical stacking and A classical/max-pool
+        # predictions, even when D is the only explicitly requested output.
+        execution_keys = [key for key in ("A", "B", "B0", "C", "D") if key in set(test_keys) | {"A", "B"}]
+
+    model_keys = [e for e in execution_keys if e != "D"]
     if model_keys:
         if _final_models_ready_for_external(args.seed, model_keys):
-            print(f"[CACHE] deployable models already exist for {model_keys}; skipping g_train")
+            print(f"[CACHE] deployable models already exist for {model_keys}; skipping h_train")
         else:
-            print("[TRAIN] g_train: refitting deployable models on full training data")
-            run_cmd([PYTHON, str(SCRIPT_DIR / "g_train.py"), "--seed", str(args.seed), "--only", ",".join(model_keys)])
-    print("[TEST] h_test: preparing test features and applying saved models")
-    test_cmd = [PYTHON, str(SCRIPT_DIR / "h_test.py"), "--prepare", "--seed", str(args.seed),
-                "--only", ",".join(test_keys), "--alpha-grid", str(args.alpha_grid)]
-    if not args.deep_analysis:
-        test_cmd.append("--no-deep-analysis")
+            print("[TRAIN] h_train: refitting deployable models on full training data")
+            run_cmd([PYTHON, str(SCRIPT_DIR / "h_train.py"), "--seed", str(args.seed), "--only", ",".join(model_keys)])
+    print("[TEST] i_test: preparing test features and applying saved models")
+    test_cmd = [PYTHON, str(SCRIPT_DIR / "i_test.py"), "--seed", str(args.seed),
+                "--only", ",".join(execution_keys)]
     run_cmd(test_cmd)
     return True
 
@@ -926,37 +987,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run A/B/B0/C/D ML experiments, stacking, and P158 external testing unless skipped."
     )
-    parser.add_argument("--alpha-grid", default=DEFAULT_LATE_FUSION_ALPHA_GRID, help="Late-fusion organ-score weight grid.")
     parser.add_argument("--skip-stacking", action="store_true", help="Do not run f_stack.py after each requested experiment completes.")
     parser.add_argument("--stacking-top-k", type=int, default=DEFAULT_STACKING_TOP_K, help="Number of cached base candidates per task/fold for f_stack.py.")
     parser.add_argument("--skip-external", action="store_true", help="Do not run the P158 external test phase.")
-    parser.add_argument("--no-deep-analysis", dest="deep_analysis", action="store_false",
-                        help="During external testing, skip merging external metrics into each experiment's "
-                             "analysis.xlsx. Deep analysis runs by default wherever valid.")
     parser.add_argument("--external-experiments", default=None, help="Comma-separated P158 experiments. Default: same as --only.")
     parser.add_argument(
         "--only",
         default=DEFAULT_PIPELINE_EXPERIMENTS,
         help="Comma-separated experiments to run after preparation. Choices: A,B,B0,C,D. "
-             "B0 (B_Organ_same) runs through nested-CV + stacking only; it is never refit/tested externally.",
+        "B0 (B_Organ_same) now runs through nested-CV, stacking, final-model refit, and external testing like B.",
     )
-    parser.add_argument("--seed", type=int, default=RANDOM_SEEDS[0],
+    parser.add_argument("--seed", type=int, default=RANDOM_STATE,
                         help="Run a single seed. Per-experiment results go to <Exp>/.../random_seed{N}/.")
     parser.add_argument("--all-seeds", action="store_true",
                         help="Run all seeds from RANDOM_SEEDS sequentially. Equivalent to running --seed N for each N.")
     args = parser.parse_args()
-
-    print("[PREPROCESS] ensuring original training data is preprocessed (resample + crop)")
-    a_preprocess.preprocess_train_datasets()
 
     requested = {x.strip().upper() for x in args.only.split(",") if x.strip()}
     invalid = requested - {"A", "B", "B0", "C", "D"}
     if invalid:
         raise ValueError(f"Unknown experiments in --only: {sorted(invalid)}")
 
+    print("[PREPROCESS] ensuring original training data is preprocessed (resample + crop)")
+    a_preprocess.preprocess_train_datasets()
+
     if args.all_seeds:
-        external_requested = [key for key in _ordered_experiments(args.external_experiments, requested) if key in {"A", "B", "C", "D"}]
-        requested_model_keys = [key for key in requested if key in {"A", "B", "C"}]
+        external_requested = [key for key in _ordered_experiments(args.external_experiments, requested) if key in {"A", "B", "B0", "C", "D"}]
+        requested_model_keys = [key for key in requested if key in {"A", "B", "B0", "C"}]
+        failed_seeds = []
         for s in RANDOM_SEEDS:
             if not args.skip_external and requested_model_keys and external_requested:
                 if _final_models_ready_for_external(s, requested_model_keys) and _external_results_ready(s, external_requested):
@@ -968,6 +1026,10 @@ def main() -> None:
             ret = _sp.run(cmd)
             if ret.returncode != 0:
                 print(f"[z_main] seed={s} FAILED with returncode={ret.returncode}")
+                failed_seeds.append((s, ret.returncode))
+        if failed_seeds:
+            detail = ", ".join(f"seed={seed}:returncode={code}" for seed, code in failed_seeds)
+            raise RuntimeError(f"One or more seed runs failed: {detail}")
         return
 
     import all_config as _acfg
@@ -988,7 +1050,6 @@ def main() -> None:
     primary_split_json = split_json_paths[ordered_requested[0]] if ordered_requested else split_json_paths["A"]
     expected_outer_folds = _expected_outer_folds(primary_split_json, default=4)
 
-    alpha_grid = parse_alpha_grid(args.alpha_grid)
 
 
     organ_ready = patch_ready = organ_same_ready = early_ready = False
@@ -1003,6 +1064,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=ORGAN_ONLY_WORKBOOK_DIR,
             split_json_path=split_json_paths["B"],
+            tasks=_tasks_for_experiment("B"),
         )
     if "A" in requested or "D" in requested:
         patch_ready = ml_result_ready(
@@ -1014,6 +1076,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=PATCH_ONLY_WORKBOOK_DIR,
             split_json_path=split_json_paths["A"],
+            tasks=_tasks_for_experiment("A"),
         )
     if "B0" in requested:
         organ_same_ready = ml_result_ready(
@@ -1025,6 +1088,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=ORGAN_SAME_WORKBOOK_DIR,
             split_json_path=split_json_paths["B0"],
+            tasks=_tasks_for_experiment("B0"),
         )
     if "C" in requested:
         early_ready = ml_result_ready(
@@ -1036,6 +1100,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=EARLY_FUSION_WORKBOOK_DIR,
             split_json_path=split_json_paths["C"],
+            tasks=_tasks_for_experiment("C"),
         )
 
     def ensure_organ_inputs_and_results() -> bool:
@@ -1054,6 +1119,7 @@ def main() -> None:
             _seed,
             split_json_path=split_json_paths["B"],
             feature_files=list(FEATURE_FILES),
+            tasks=_tasks_for_experiment("B"),
         )
         organ_ready = ml_result_ready(
             ORGAN_ONLY_RESULTS_DIR,
@@ -1064,6 +1130,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=ORGAN_ONLY_WORKBOOK_DIR,
             split_json_path=split_json_paths["B"],
+            tasks=_tasks_for_experiment("B"),
         )
         return changed
 
@@ -1083,6 +1150,7 @@ def main() -> None:
             _seed,
             split_json_path=split_json_paths["B0"],
             feature_files=list(FEATURE_FILES),
+            tasks=_tasks_for_experiment("B0"),
         )
         organ_same_ready = ml_result_ready(
             ORGAN_SAME_RESULTS_DIR,
@@ -1093,6 +1161,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=ORGAN_SAME_WORKBOOK_DIR,
             split_json_path=split_json_paths["B0"],
+            tasks=_tasks_for_experiment("B0"),
         )
         return changed
 
@@ -1112,6 +1181,7 @@ def main() -> None:
             _seed,
             split_json_path=split_json_paths["A"],
             feature_files=list(FEATURE_FILES),
+            tasks=_tasks_for_experiment("A"),
         )
         patch_ready = ml_result_ready(
             PATCH_ONLY_RESULTS_DIR,
@@ -1122,6 +1192,7 @@ def main() -> None:
             expected_outer_folds=expected_outer_folds,
             workbook_dir=PATCH_ONLY_WORKBOOK_DIR,
             split_json_path=split_json_paths["A"],
+            tasks=_tasks_for_experiment("A"),
         )
         return changed
 
@@ -1143,6 +1214,10 @@ def main() -> None:
     # and external data is available) before the next experiment starts.
     if "A" in requested:
         patch_changed = ensure_patch_inputs_and_results()
+        if patch_changed or not g_maxPool.internal_ready(_seed):
+            run_cmd([PYTHON, str(SCRIPT_DIR / "g_maxPool.py"), "--stage", "internal", "--seed", str(_seed)])
+        else:
+            print("[CACHE] A_Patch max-pool zone result available; skipping g_maxPool")
         maybe_run_stacking(
             "A", requested, args.skip_stacking, args.stacking_top_k, _seed,
             split_json_path=split_json_paths["A"], upstream_changed=patch_changed
@@ -1165,7 +1240,8 @@ def main() -> None:
             "B0", requested, args.skip_stacking, args.stacking_top_k, _seed,
             split_json_path=split_json_paths["B0"], upstream_changed=organ_same_changed
         )
-        # B0 (B_Organ_same) is never refit/tested externally.
+        if not args.skip_external and "B0" in external_requested:
+            run_external_test(args, ["B0"])
 
     if "C" in requested:
         early_changed = False
@@ -1180,6 +1256,7 @@ def main() -> None:
                 _seed,
                 split_json_path=split_json_paths["C"],
                 feature_files=list(FEATURE_FILES),
+                tasks=_tasks_for_experiment("C"),
             )
         maybe_run_stacking(
             "C", requested, args.skip_stacking, args.stacking_top_k, _seed,
@@ -1191,16 +1268,32 @@ def main() -> None:
     if "D" in requested:
         organ_changed = ensure_organ_inputs_and_results()
         patch_changed = ensure_patch_inputs_and_results()
-        late_now_ready = late_fusion_ready(alpha_grid)
-        if late_now_ready and not organ_changed and not patch_changed:
+        upstream_stacking_changed = False
+        for upstream_key, upstream_changed in (("A", patch_changed), ("B", organ_changed)):
+            if upstream_changed or not stacking_ready(upstream_key, split_json_paths[upstream_key]):
+                if args.skip_stacking:
+                    raise RuntimeError(
+                        f"D_Late needs {upstream_key} final_stacking.xlsx; rerun without --skip-stacking"
+                    )
+                run_stacking(
+                    {upstream_key}, args.stacking_top_k, _seed,
+                    split_json_path=split_json_paths[upstream_key],
+                )
+                upstream_stacking_changed = True
+        maxpool_changed = False
+        if patch_changed or not g_maxPool.internal_ready(_seed):
+            run_cmd([PYTHON, str(SCRIPT_DIR / "g_maxPool.py"), "--stage", "internal", "--seed", str(_seed)])
+            maxpool_changed = True
+        else:
+            print("[CACHE] A_Patch max-pool zone result available for D_Late; skipping g_maxPool")
+        late_now_ready = late_fusion_ready()
+        if late_now_ready and not organ_changed and not patch_changed and not upstream_stacking_changed and not maxpool_changed:
             print("[CACHE] D_Late final results available and A/B dependencies unchanged; skipping D_Late")
             late_changed = False
         else:
-            late_changed = run_late_fusion(alpha_grid, force=organ_changed or patch_changed)
-        maybe_run_stacking(
-            "D", requested, args.skip_stacking, args.stacking_top_k, _seed,
-            split_json_path=split_json_paths["B"], upstream_changed=late_changed
-        )
+            late_changed = run_late_fusion(
+                force=organ_changed or patch_changed or upstream_stacking_changed or maxpool_changed,
+            )
         if not args.skip_external and "D" in external_requested:
             run_external_test(args, ["D"])
 

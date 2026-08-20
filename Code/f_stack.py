@@ -13,8 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 
 import all_config as cfg_module
 from all_config import (
@@ -35,7 +33,7 @@ from all_config import (
 import e_ml as base
 
 
-TASKS = ("cs", "zone")
+TASKS = tuple(cfg_module.CLASSICAL_TASKS)
 
 
 CONFIG = dict(base.CONFIG)
@@ -51,7 +49,6 @@ CONFIG.update({
     "meta_std_auc_penalty": 0.0,
 
 
-    "meta_lr_C_grid": [0.05, 0.1, 0.3, 1.0, 3.0],
     "meta_min_candidates": 1,
     "meta_min_oof_coverage": 1.0,
     "meta_score_transform": "rank",
@@ -250,7 +247,7 @@ def load_candidate_cache(config: Dict[str, Any], logger: logging.Logger) -> pd.D
         file_tag = os.path.splitext(file_name)[0]
         file_dir = os.path.join(previous_root, file_tag)
 
-        for task in TASKS:
+        for task in tuple(config.get("tasks") or TASKS):
             book = os.path.join(file_dir, f"results_{task}_{file_tag}.xlsx")
             resolved = resolve_workbook_readonly(book)
             if resolved is None:
@@ -396,8 +393,8 @@ def select_late_fusion_candidates(
         return sub
 
     pool = pd.concat([
-        _tagged(cache_a, "A_organ", ORGAN_ONLY_WORKBOOK_DIR),
-        _tagged(cache_b, "B_patch", PATCH_ONLY_WORKBOOK_DIR),
+        _tagged(cache_a, "B_organ", ORGAN_ONLY_WORKBOOK_DIR),
+        _tagged(cache_b, "A_patch", PATCH_ONLY_WORKBOOK_DIR),
     ], ignore_index=True)
 
     if pool.empty:
@@ -488,17 +485,6 @@ def build_label_maps(reference_file: str, config: Dict[str, Any]) -> Dict[str, D
     return {"cs": cs_map, "zone": zone_map}
 
 
-def get_inner_fold_by_case(outer: Dict[str, Any]) -> Dict[str, int]:
-    out = {}
-    for inner in outer["inner_splits"]:
-        fold = int(inner["inner_fold"])
-        for raw_cid in inner.get("val_case_ids", []):
-            cid = _clean_case_id(raw_cid)
-            if cid is not None:
-                out[cid] = fold
-    return out
-
-
 def ordered_ids(ids: List[str], allowed_map: Dict[str, Any]) -> List[str]:
     out = []
     for raw_cid in ids:
@@ -525,8 +511,10 @@ def _clean_case_id(value: Any) -> Optional[str]:
 def validate_inner_oof_split_coverage(
     split_payload: Dict[str, Any],
     label_maps: Dict[str, Dict[str, Any]],
+    tasks: tuple[str, ...] | None = None,
 ) -> List[str]:
     errors: List[str] = []
+    tasks = tuple(tasks or TASKS)
     for outer in split_payload.get("outer_splits", []):
         outer_fold = int(outer.get("outer_fold", -1))
         inner_val_union = {
@@ -544,7 +532,7 @@ def validate_inner_oof_split_coverage(
                 f"[SPLIT OOF COVERAGE FAIL] outer={outer_fold} inner validation contains "
                 f"{len(extra_inner)} IDs not present in outer train; examples={extra_inner[:8]}"
             )
-        for task in TASKS:
+        for task in tasks:
             task_map = label_maps.get(task, {})
             expected_train = {cid for cid in outer_train_all if cid in task_map}
             covered_train = {cid for cid in inner_val_union if cid in task_map}
@@ -626,6 +614,7 @@ def fit_fixed_candidate(
         "pca_components": pca_components,
         "pca_explained_var_sum": pca_explained,
         "clf": clf,
+        "task_name": task_name,
         "score_source": None,
         "n_input_features": prep.stats.get("n_input_features", np.nan),
         "n_after_quasi": prep.stats.get("n_after_quasi", np.nan),
@@ -652,7 +641,8 @@ def predict_fixed_candidate(
     else:
         Xfinal = Xsel
 
-    y_score, y_pred, score_source = base.get_scores_and_preds(state["clf"], Xfinal)
+    y_score, _y_pred, score_source = base.get_scores_and_preds(state["clf"], Xfinal)
+    y_pred = score_to_pred(y_score, fixed_threshold(state.get("task_name", "")))
     pred_ids = [_clean_case_id(x) for x in predict_df[id_col].tolist()]
     return pd.DataFrame({
         "case_id": pred_ids,
@@ -784,8 +774,12 @@ def safe_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndar
     return base.compute_metrics(y_true.astype(int), y_score.astype(float), y_pred.astype(int))
 
 
-def score_to_pred(score: np.ndarray) -> np.ndarray:
-    return (np.asarray(score, dtype=float) >= 0.5).astype(int)
+def fixed_threshold(task_name: str) -> float:
+    return 0.45 if str(task_name).lower() == "zone" else 0.5
+
+
+def score_to_pred(score: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    return (np.asarray(score, dtype=float) >= float(threshold)).astype(int)
 
 
 def series_from_pred_df(df: pd.DataFrame, ids: List[str], col: str) -> pd.Series:
@@ -883,7 +877,7 @@ def assemble_meta_matrices(
         oof_pred_values = oof_pred.astype(float).values
         oof_pred_arr = np.where(
             np.isnan(oof_pred_values),
-            score_to_pred(oof_score_arr),
+            score_to_pred(oof_score_arr, fixed_threshold(task_name)),
             oof_pred_values,
         ).astype(int)
 
@@ -891,7 +885,7 @@ def assemble_meta_matrices(
         eval_pred_values = eval_pred.astype(float).values
         eval_pred_arr = np.where(
             np.isnan(eval_pred_values),
-            score_to_pred(eval_score_arr),
+            score_to_pred(eval_score_arr, fixed_threshold(task_name)),
             eval_pred_values,
         ).astype(int)
 
@@ -967,153 +961,16 @@ def assemble_meta_matrices(
     }
 
 
-def metric_rank(metrics: Dict[str, float], complexity: int) -> Tuple[float, float, int]:
-    auc = metrics.get("auc", np.nan)
-    ap = metrics.get("ap", np.nan)
-    auc_rank = float(auc) if not pd.isna(auc) else -np.inf
-    ap_rank = float(ap) if not pd.isna(ap) else -np.inf
-    return auc_rank, ap_rank, -int(complexity)
-
-
-def fit_final_meta_lr(
+def fit_weighted_average(
     z_oof: np.ndarray,
     y_train: np.ndarray,
-    z_eval: np.ndarray,
-    z_all: np.ndarray,
-    C: float,
-    task_name: str,
-    config: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray]:
-    scaler = StandardScaler()
-    ztr = scaler.fit_transform(z_oof)
-    clf = LogisticRegression(
-        C=float(C),
-        solver="lbfgs",
-        class_weight=base.get_class_weight(task_name, config),
-        max_iter=config["max_iter"],
-        tol=config["tol"],
-        random_state=config["random_state"],
-    )
-    clf.fit(ztr, y_train.astype(int))
-
-    eval_score = (
-        clf.predict_proba(scaler.transform(z_eval))[:, 1]
-        if z_eval.shape[0]
-        else np.array([], dtype=float)
-    )
-    all_score = (
-        clf.predict_proba(scaler.transform(z_all))[:, 1]
-        if z_all.shape[0]
-        else np.array([], dtype=float)
-    )
-    return eval_score, all_score
-
-
-def meta_lr_cv_oof(
-    z_oof: np.ndarray,
-    y_train: np.ndarray,
-    fold_ids: np.ndarray,
-    C: float,
-    task_name: str,
-    config: Dict[str, Any],
-) -> Optional[np.ndarray]:
-    pred = np.full(len(y_train), np.nan, dtype=float)
-    for fold in sorted(set(fold_ids.tolist())):
-        va = fold_ids == fold
-        tr = ~va
-        if np.sum(va) == 0 or len(np.unique(y_train[tr])) < 2:
-            return None
-        scaler = StandardScaler()
-        ztr = scaler.fit_transform(z_oof[tr])
-        clf = LogisticRegression(
-            C=float(C),
-            solver="lbfgs",
-            class_weight=base.get_class_weight(task_name, config),
-            max_iter=config["max_iter"],
-            tol=config["tol"],
-            random_state=config["random_state"],
-        )
-        clf.fit(ztr, y_train[tr].astype(int))
-        pred[va] = clf.predict_proba(scaler.transform(z_oof[va]))[:, 1]
-
-    if np.any(np.isnan(pred)):
-        return None
-    return pred
-
-
-def choose_and_fit_meta(
-    z_oof: np.ndarray,
-    y_train: np.ndarray,
-    fold_ids: np.ndarray,
     z_eval: np.ndarray,
     y_eval: np.ndarray,
     z_all: np.ndarray,
     kept: List[Dict[str, Any]],
     task_name: str,
     outer_fold: int,
-    config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    method_rows = []
-    choices = []
-
-    def add_choice(method: str, score_oof: np.ndarray, score_eval: np.ndarray, score_all: np.ndarray, complexity: int, extra: Dict[str, Any]):
-        pred_oof = score_to_pred(score_oof)
-        pred_eval = score_to_pred(score_eval) if len(score_eval) else np.array([], dtype=int)
-        oof_metrics = safe_binary_metrics(y_train, score_oof, pred_oof)
-        eval_metrics = safe_binary_metrics(y_eval, score_eval, pred_eval)
-        row = {
-            "task": task_name,
-            "outer_fold": outer_fold,
-            "meta_method": method,
-            "complexity": complexity,
-            "n_meta_features": int(z_oof.shape[1]),
-            **extra,
-            **{f"meta_inner_{k}": v for k, v in oof_metrics.items()},
-            **{f"outer_{k}": v for k, v in eval_metrics.items()},
-        }
-        method_rows.append(row)
-        choices.append({
-            "method": method,
-            "rank": metric_rank(oof_metrics, complexity),
-            "score_eval": score_eval,
-            "score_all": score_all,
-            "oof_metrics": oof_metrics,
-            "eval_metrics": eval_metrics,
-            "extra": extra,
-        })
-
-
-    best_j = None
-    best_rank = None
-    for j, res in enumerate(kept):
-        score = z_oof[:, j]
-        mets = safe_binary_metrics(y_train, score, score_to_pred(score))
-        r = metric_rank(mets, complexity=0)
-        if best_rank is None or r > best_rank:
-            best_rank = r
-            best_j = j
-    if best_j is not None:
-        add_choice(
-            "single_best",
-            z_oof[:, best_j],
-            z_eval[:, best_j] if z_eval.shape[0] else np.array([], dtype=float),
-            z_all[:, best_j] if z_all.shape[0] else np.array([], dtype=float),
-            complexity=0,
-            extra={
-                "selected_base_candidate_id": kept[best_j]["candidate_id"],
-                "meta_C": np.nan,
-            },
-        )
-
-    add_choice(
-        "simple_average",
-        np.mean(z_oof, axis=1),
-        np.mean(z_eval, axis=1) if z_eval.shape[0] else np.array([], dtype=float),
-        np.mean(z_all, axis=1) if z_all.shape[0] else np.array([], dtype=float),
-        complexity=1,
-        extra={"selected_base_candidate_id": "", "meta_C": np.nan},
-    )
-
     weights = np.array([
         max(float(res.get("oof_auc", np.nan)) - 0.5, 0.001)
         if not pd.isna(res.get("oof_auc", np.nan))
@@ -1121,41 +978,42 @@ def choose_and_fit_meta(
         for res in kept
     ], dtype=float)
     weights = weights / weights.sum()
-    add_choice(
-        "weighted_average",
-        np.average(z_oof, axis=1, weights=weights),
-        np.average(z_eval, axis=1, weights=weights) if z_eval.shape[0] else np.array([], dtype=float),
-        np.average(z_all, axis=1, weights=weights) if z_all.shape[0] else np.array([], dtype=float),
-        complexity=1,
-        extra={
-            "selected_base_candidate_id": "",
-            "meta_C": np.nan,
-            "weights_json": json.dumps({kept[i]["candidate_id"]: round(float(weights[i]), 4) for i in range(len(kept))}, sort_keys=True),
-        },
+    score_oof = np.average(z_oof, axis=1, weights=weights)
+    score_eval = np.average(z_eval, axis=1, weights=weights) if z_eval.shape[0] else np.array([], dtype=float)
+    score_all = np.average(z_all, axis=1, weights=weights) if z_all.shape[0] else np.array([], dtype=float)
+    threshold = fixed_threshold(task_name)
+    oof_metrics = safe_binary_metrics(y_train, score_oof, score_to_pred(score_oof, threshold))
+    eval_metrics = safe_binary_metrics(
+        y_eval,
+        score_eval,
+        score_to_pred(score_eval, threshold) if len(score_eval) else np.array([], dtype=int),
     )
-
-    for C in config["meta_lr_C_grid"]:
-        score_oof_cv = meta_lr_cv_oof(z_oof, y_train, fold_ids, C, task_name, config)
-        if score_oof_cv is None:
-            continue
-        score_eval, score_all = fit_final_meta_lr(z_oof, y_train, z_eval, z_all, C, task_name, config)
-        add_choice(
-            f"logreg_stack_C={C}",
-            score_oof_cv,
-            score_eval,
-            score_all,
-            complexity=2,
-            extra={"selected_base_candidate_id": "", "meta_C": float(C)},
-        )
-
-    if not choices:
-        raise RuntimeError("No valid meta choices")
-
-    chosen = max(choices, key=lambda x: x["rank"])
+    extra = {
+        "weights_json": json.dumps(
+            {kept[i]["candidate_id"]: round(float(weights[i]), 4) for i in range(len(kept))},
+            sort_keys=True,
+        ),
+    }
+    chosen = {
+        "method": "weighted_average",
+        "score_eval": score_eval,
+        "score_all": score_all,
+        "oof_metrics": oof_metrics,
+        "eval_metrics": eval_metrics,
+        "extra": extra,
+    }
+    method_row = {
+        "task": task_name,
+        "outer_fold": outer_fold,
+        "meta_method": "weighted_average",
+        "n_meta_features": int(z_oof.shape[1]),
+        **extra,
+        **{f"meta_inner_{k}": v for k, v in oof_metrics.items()},
+        **{f"outer_{k}": v for k, v in eval_metrics.items()},
+    }
     return {
         "chosen": chosen,
-        "method_rows": method_rows,
-        "all_choices": choices,
+        "method_rows": [method_row],
     }
 
 
@@ -1225,11 +1083,9 @@ def run_task_outer_meta(
     outer_fold = int(outer["outer_fold"])
     train_ids = ordered_ids(outer["train_case_ids"], label_maps[task_name])
     eval_ids = ordered_ids(outer["test_case_ids"], label_maps[task_name])
-    inner_fold_map = get_inner_fold_by_case(outer)
 
     y_train = np.array([label_maps[task_name][cid] for cid in train_ids], dtype=int)
     y_eval = np.array([label_maps[task_name][cid] for cid in eval_ids], dtype=int)
-    fold_ids = np.array([inner_fold_map[cid] for cid in train_ids], dtype=int)
 
     if len(train_ids) == 0 or len(np.unique(y_train)) < 2:
         raise RuntimeError(f"{task_name} outer {outer_fold} has insufficient meta training data")
@@ -1321,24 +1177,22 @@ def run_task_outer_meta(
         logger.error(f"[NO CANDIDATES] task={task_name} outer={outer_fold} {detail}")
         raise RuntimeError(detail)
 
-    meta = choose_and_fit_meta(
+    meta = fit_weighted_average(
         assembled["z_oof"],
         y_train,
-        fold_ids,
         assembled["z_eval"],
         y_eval,
         assembled["z_all"],
         assembled["kept"],
         task_name,
         outer_fold,
-        config,
     )
 
     chosen = meta["chosen"]
 
     eval_score = chosen["score_eval"]
-    eval_pred = score_to_pred(eval_score)
-    eval_metrics = safe_binary_metrics(y_eval, eval_score, eval_pred)
+    eval_pred = score_to_pred(eval_score, fixed_threshold(task_name))
+    eval_metrics = chosen["eval_metrics"]
 
     fold_row = {
         "task": task_name,
@@ -1544,7 +1398,7 @@ def load_existing_split_payload(config: Dict[str, Any]) -> Tuple[Dict[str, Any],
 
 def dry_run_candidate_cache(cache_df: pd.DataFrame, split_payload: Dict[str, Any], config: Dict[str, Any]) -> None:
     print(f"candidate_cache_rows={len(cache_df)}")
-    for task in TASKS:
+    for task in tuple(config.get("tasks") or TASKS):
         print(f"\n[{task}]")
         for outer in split_payload["outer_splits"]:
             outer_fold = int(outer["outer_fold"])
@@ -1563,6 +1417,7 @@ def dry_run_candidate_cache(cache_df: pd.DataFrame, split_payload: Dict[str, Any
 
 
 def run_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
+    tasks = tuple(config.get("tasks") or TASKS)
     if dry_run:
         logger = setup_stdout_logger()
         split_payload, split_used = load_existing_split_payload(config)
@@ -1599,7 +1454,7 @@ def run_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
 
     label_maps = build_label_maps(reference_file, config)
 
-    split_coverage_errors = validate_inner_oof_split_coverage(split_payload, label_maps)
+    split_coverage_errors = validate_inner_oof_split_coverage(split_payload, label_maps, tasks=tasks)
     if split_coverage_errors:
         for msg in split_coverage_errors[:20]:
             logger.error(msg)
@@ -1618,7 +1473,7 @@ def run_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
     failed_or_missing = []
     for outer in split_payload["outer_splits"]:
         outer_fold = int(outer["outer_fold"])
-        for task in TASKS:
+        for task in tasks:
             logger.debug(f"[OUTER START] task={task} outer={outer_fold}")
             candidates = select_cached_candidates(cache_df, task, outer_fold, config)
             if not candidates:
@@ -1648,7 +1503,7 @@ def run_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
     overall_df = build_overall_summary(stores["meta_fold_rows"], stores["meta_pred_rows"])
     write_meta_outputs(result_root, stores, overall_df, logger)
 
-    expected_pairs = {(task, int(outer["outer_fold"])) for outer in split_payload["outer_splits"] for task in TASKS}
+    expected_pairs = {(task, int(outer["outer_fold"])) for outer in split_payload["outer_splits"] for task in tasks}
     completed_pairs = {
         (str(row.get("task")), int(row.get("outer_fold")))
         for row in stores["meta_fold_rows"]
@@ -1667,102 +1522,151 @@ def run_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
     logger.debug("Stacking pipeline finished")
 
 
-def run_late_fusion_stacking_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
-    logger = setup_stdout_logger()
-    split_payload, split_used = load_existing_split_payload(config)
-    logger.debug(f"Split JSON used: {split_used}")
+def load_precomputed_late_predictions(config: Dict[str, Any], task: str) -> pd.DataFrame:
+    root = Path(config["results_dir"])
+    frames = []
+    required = {"file", "fs_method", "clf_model", "alpha", "outer_fold", "case_id", "y_true", "y_score"}
+    for file_name in config["file_order"]:
+        file_tag = Path(file_name).stem
+        path = root / file_tag / f"predictions_{task}_{file_tag}.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing D late-fusion predictions for stacking: {path}")
+        frame = cfg_module.read_predictions(path)
+        missing = required - set(frame.columns)
+        if missing:
+            raise RuntimeError(f"{path} missing required columns: {sorted(missing)}")
+        frames.append(frame)
+    out = pd.concat(frames, ignore_index=True)
+    out["case_id"] = out["case_id"].apply(_clean_case_id)
+    return out.dropna(subset=["case_id"]).copy()
 
-    cache_a_cfg = dict(config)
-    cache_a_cfg["previous_results_dir"] = str(ORGAN_ONLY_RESULTS_DIR)
-    cache_a_cfg["enabled_feature_selectors"] = list(EXPERIMENTS["B"]["feature_selectors"])
-    cache_a_cfg["enabled_models"] = list(EXPERIMENTS["B"]["classifiers"])
-    cache_a = load_candidate_cache(cache_a_cfg, logger)
 
-    cache_b_cfg = dict(config)
-    cache_b_cfg["previous_results_dir"] = str(PATCH_ONLY_RESULTS_DIR)
-    cache_b_cfg["enabled_feature_selectors"] = list(EXPERIMENTS["A"]["feature_selectors"])
-    cache_b_cfg["enabled_models"] = list(EXPERIMENTS["A"]["classifiers"])
-    cache_b = load_candidate_cache(cache_b_cfg, logger)
+def run_precomputed_late_zone_outer(
+    predictions: pd.DataFrame,
+    outer: Dict[str, Any],
+    label_maps: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    task_name = "zone"
+    outer_fold = int(outer["outer_fold"])
+    eval_ids = ordered_ids(outer["test_case_ids"], label_maps[task_name])
+    y_eval = np.asarray([label_maps[task_name][cid] for cid in eval_ids], dtype=int)
+    fold = predictions[pd.to_numeric(predictions["outer_fold"], errors="coerce") == outer_fold].copy()
+    if fold.empty:
+        raise RuntimeError(f"No D late-fusion zone predictions for outer fold {outer_fold}")
 
-    if cache_a.empty or cache_b.empty:
-        raise RuntimeError(
-            "C stacking needs both B_Organ and A_Patch fold_metrics workbooks."
+    key_cols = ["file", "fs_method", "clf_model", "alpha"]
+    candidates = fold[key_cols].drop_duplicates().sort_values(key_cols, kind="stable").reset_index(drop=True)
+    score_columns = []
+    selected_rows = []
+    base_outer_rows = []
+    for rank, candidate in candidates.iterrows():
+        mask = pd.Series(True, index=fold.index)
+        for col in key_cols:
+            mask &= fold[col].astype(str) == str(candidate[col])
+        block = fold.loc[mask, ["case_id", "y_true", "y_score"]].drop_duplicates("case_id")
+        scores = series_from_pred_df(block.rename(columns={"case_id": "case_id"}), eval_ids, "y_score")
+        if scores.isna().any():
+            missing_ids = scores[scores.isna()].index.tolist()[:8]
+            raise RuntimeError(
+                f"D late-fusion candidate missing zone predictions outer={outer_fold}; examples={missing_ids}"
+            )
+        score = scores.to_numpy(dtype=float)
+        score_columns.append(score)
+        candidate_id = (
+            f"D_late_fusion::zone::{outer_fold}::{candidate['file']}::"
+            f"{candidate['fs_method']}::{candidate['clf_model']}::alpha={candidate['alpha']}"
         )
+        metrics = safe_binary_metrics(y_eval, score, score_to_pred(score, fixed_threshold(task_name)))
+        selected_rows.append({
+            "task": task_name,
+            "outer_fold": outer_fold,
+            "candidate_rank": int(rank) + 1,
+            "candidate_id": candidate_id,
+            "source": "D_late_fusion",
+            "file": candidate["file"],
+            "fs_method": candidate["fs_method"],
+            "clf_model": candidate["clf_model"],
+            "alpha": float(candidate["alpha"]),
+            "status": "used_precomputed_fusion",
+        })
+        base_outer_rows.append({
+            "task": task_name,
+            "outer_fold": outer_fold,
+            "candidate_rank": int(rank) + 1,
+            "candidate_id": candidate_id,
+            "source": "D_late_fusion",
+            "file": candidate["file"],
+            "fs_method": candidate["fs_method"],
+            "clf_model": candidate["clf_model"],
+            "alpha": float(candidate["alpha"]),
+            **metrics,
+        })
 
-    if dry_run:
-        print(f"A_candidate_cache_rows={len(cache_a)}")
-        print(f"B_candidate_cache_rows={len(cache_b)}")
-        for task in TASKS:
-            print(f"\n[C stacked late fusion: {task}]")
-            for outer in split_payload["outer_splits"]:
-                outer_fold = int(outer["outer_fold"])
-                selected = select_late_fusion_candidates(cache_a, cache_b, task, outer_fold, config)
-                print(f"outer_fold={outer_fold} selected={len(selected)} A+B candidates")
-                for cand in selected[: min(5, len(selected))]:
-                    print(
-                        "  "
-                        f"rank={cand['candidate_rank']} source={cand['source']} "
-                        f"auc={float(cand['inner_mean_auc']):.4f} "
-                        f"file={cand['file']} "
-                        f"fs={cand['fs_method']} clf={cand['clf_model']} pca={cand['pca_var']}"
-                    )
-        return
-
-    result_root = config["results_dir"]
-    base.ensure_dir(result_root)
-    logger.debug("Stacking pipeline started: D_Late")
-
-    reference_file = os.path.join(str(ORGAN_ONLY_WORKBOOK_DIR), config["file_order"][0])
-    label_maps = build_label_maps(reference_file, config)
-
-    split_coverage_errors = validate_inner_oof_split_coverage(split_payload, label_maps)
-    if split_coverage_errors:
-        for msg in split_coverage_errors[:20]:
-            logger.error(msg)
-        cleanup_incomplete_stacking_outputs(result_root, logger)
-        raise RuntimeError("stacking_preflight_split_oof_coverage_failed: " + " | ".join(split_coverage_errors[:5]))
-
-    stores = {
-        "meta_fold_rows": [],
-        "meta_pred_rows": [],
-        "selected_rows": [],
+    # Candidate membership is fixed by the configured fusion grid. Averaging is
+    # label-free, so outer-test labels are used only for the reported metrics.
+    eval_score = np.mean(np.column_stack(score_columns), axis=1)
+    eval_pred = score_to_pred(eval_score, fixed_threshold(task_name))
+    eval_metrics = safe_binary_metrics(y_eval, eval_score, eval_pred)
+    method = "late_fusion_average"
+    fold_row = {
+        "task": task_name,
+        "outer_fold": outer_fold,
+        "meta_method": method,
+        "n_cache_candidates_selected": int(len(candidates)),
+        "n_candidates_recomputed": 0,
+        "n_candidates_used": int(len(candidates)),
+        "n_meta_train": 0,
+        "n_test": int(len(y_eval)),
+        "train_class_dist": "{}",
+        "test_class_dist": json.dumps(dict(Counter(y_eval.tolist())), sort_keys=True),
+        **eval_metrics,
+    }
+    pred_rows = [
+        {
+            "task": task_name,
+            "outer_fold": outer_fold,
+            "case_id": cid,
+            "y_true": int(y_true),
+            "y_score": float(score),
+            "y_pred": int(pred),
+            "meta_method": method,
+        }
+        for cid, y_true, score, pred in zip(eval_ids, y_eval, eval_score, eval_pred)
+    ]
+    method_rows = [{
+        "task": task_name,
+        "outer_fold": outer_fold,
+        "meta_method": method,
+        "complexity": 1,
+        "n_meta_features": int(len(candidates)),
+        **{f"outer_{key}": value for key, value in eval_metrics.items()},
+    }]
+    return {
+        "fold_row": fold_row,
+        "pred_rows": pred_rows,
+        "selected_rows": selected_rows,
         "base_oof_rows": [],
-        "base_outer_rows": [],
-        "meta_method_rows": [],
+        "base_outer_rows": base_outer_rows,
+        "meta_method_rows": method_rows,
     }
 
-    for outer in split_payload["outer_splits"]:
-        outer_fold = int(outer["outer_fold"])
-        for task in TASKS:
-            logger.debug(f"[OUTER START] task={task} outer={outer_fold}")
-            candidates = select_late_fusion_candidates(cache_a, cache_b, task, outer_fold, config)
-            if not candidates:
-                msg = f"[NO CANDIDATES] task={task} outer={outer_fold}"
-                logger.error(msg)
-                cleanup_incomplete_stacking_outputs(result_root, logger)
-                raise RuntimeError("stacking_stopped_no_candidates: " + msg)
 
-            try:
-                result = run_task_outer_meta(task, outer, candidates, label_maps, config, logger)
-            except Exception as e:
-                msg = f"[OUTER FAIL] task={task} outer={outer_fold} err={repr(e)}"
-                logger.error(msg)
-                logger.error(traceback.format_exc())
-                cleanup_incomplete_stacking_outputs(result_root, logger)
-                raise RuntimeError("stacking_stopped_outer_fail: " + msg) from e
+def run_late_fusion_stacking_pipeline(config: Dict[str, Any], dry_run: bool = False) -> None:
+    import d_fusion
 
-            stores["meta_fold_rows"].append(result["fold_row"])
-            stores["meta_pred_rows"].extend(result["pred_rows"])
-            stores["selected_rows"].extend(result["selected_rows"])
-            stores["base_oof_rows"].extend(result["base_oof_rows"])
-            stores["base_outer_rows"].extend(result["base_outer_rows"])
-            stores["meta_method_rows"].extend(result["meta_method_rows"])
-
-            logger.info(f"[OUTER DONE] task={task} outer={outer_fold}")
-
-    overall_df = build_overall_summary(stores["meta_fold_rows"], stores["meta_pred_rows"])
-    write_meta_outputs(result_root, stores, overall_df, logger)
-    logger.debug("Stacking pipeline finished: D_Late")
+    patch_results_dir = Path(config.get("late_patch_results_dir") or PATCH_ONLY_RESULTS_DIR)
+    organ_results_dir = Path(config.get("late_organ_results_dir") or ORGAN_ONLY_RESULTS_DIR)
+    if dry_run:
+        print("D_Late directly fuses final A_Patch and B_Organ prediction scores")
+        print(f"A_Patch={patch_results_dir / 'final_stacking.xlsx'}")
+        print(f"B_Organ={organ_results_dir / 'final_stacking.xlsx'}")
+        print(f"alpha(A_Patch)={cfg_module.LATE_FUSION_ALPHA}")
+        return
+    d_fusion.compute_late_fusion(
+        patch_results_dir,
+        organ_results_dir,
+        Path(config["results_dir"]),
+    )
 
 
 def build_config_for_experiment(args: argparse.Namespace, experiment_key: str) -> Optional[Dict[str, Any]]:
@@ -1775,11 +1679,13 @@ def build_config_for_experiment(args: argparse.Namespace, experiment_key: str) -
     cfg["experiment_key"] = experiment_key
     cfg["experiment_name"] = meta["name"]
     cfg["stack_kind"] = meta["stack_kind"]
+    cfg["tasks"] = list(cfg_module.classical_tasks_for_experiment(experiment_key))
     cfg["base_dir"] = str(Path(args.base_dir) if args.base_dir else meta["workbook_dir"])
     cfg["previous_results_dir"] = str(Path(args.previous_results_dir) if args.previous_results_dir else meta["results_dir"])
     cfg["results_dir"] = str(Path(args.results_dir) if args.results_dir else meta["results_dir"])
+    default_split_root = EXPERIMENTS["B"]["results_dir"] if experiment_key == "D" else cfg["results_dir"]
     cfg["json_path"] = str(Path(args.json_path)) if args.json_path else str(
-        Path(cfg["results_dir"]) / cfg_module.split_json_name(cfg["random_state"])
+        Path(default_split_root) / cfg_module.split_json_name(cfg["random_state"])
     )
     cfg["file_order"] = list(meta["feature_files"])
     cfg["enabled_feature_selectors"] = list(meta["feature_selectors"])
@@ -1790,6 +1696,8 @@ def build_config_for_experiment(args: argparse.Namespace, experiment_key: str) -
     cfg["meta_diversity_max_per_model"] = int(args.max_per_model)
     cfg["meta_std_auc_penalty"] = float(args.std_auc_penalty)
     cfg["meta_score_transform"] = args.score_transform
+    cfg["late_organ_results_dir"] = str(Path(args.late_organ_results_dir)) if args.late_organ_results_dir else None
+    cfg["late_patch_results_dir"] = str(Path(args.late_patch_results_dir)) if args.late_patch_results_dir else None
     return cfg
 
 
@@ -1806,14 +1714,17 @@ def parse_experiment_list(raw: str) -> List[str]:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "Run final_meta stacking logic on the updated A/B/C/D experiment outputs. "
+            "Run final_meta stacking logic on the updated A/B/B0/C/D experiment outputs. "
             "Writes only final_stacking.xlsx inside each selected result folder."
         )
     )
     parser.add_argument(
         "--only",
         default=cfg_module.DEFAULT_STACK_EXPERIMENTS,
-        help="Comma-separated experiments to stack. Choices: A,B,B0,C,D. D uses stacked late fusion from B+A candidates.",
+        help=(
+            "Comma-separated experiments to stack. Choices: A,B,B0,C,D. "
+            "D directly fuses final A_Patch and B_Organ scores with equal weights."
+        ),
     )
     parser.add_argument("--base-dir", default=None, help="Override workbook folder. Use only when running one experiment.")
     parser.add_argument("--previous-results-dir", default=None, help="Override prior ML result folder. Use only when running one experiment.")
@@ -1830,14 +1741,19 @@ if __name__ == "__main__":
         help="Candidate selection score is inner_mean_auc - penalty * inner_std_auc.",
     )
     parser.add_argument("--score-transform", choices=["rank", "none"], default=CONFIG["meta_score_transform"])
+    parser.add_argument("--late-organ-results-dir", default=None, help="Override B_Organ result folder used by D fusion.")
+    parser.add_argument("--late-patch-results-dir", default=None, help="Override A_Patch result folder used by D fusion.")
     parser.add_argument("--dry-run", action="store_true", help="Only print cached candidate selections; do not recompute models.")
-    parser.add_argument("--seed", type=int, default=cfg_module.RANDOM_SEEDS[0])
+    parser.add_argument("--seed", type=int, default=cfg_module.RANDOM_STATE)
     parser.add_argument("--all-seeds", action="store_true", help="Run for all seeds in RANDOM_SEEDS sequentially.")
 
     args = parser.parse_args()
     requested = parse_experiment_list(args.only)
-    if len(requested) != 1 and (args.base_dir or args.previous_results_dir or args.results_dir):
-        raise ValueError("--base-dir, --previous-results-dir, and --results-dir overrides require exactly one experiment in --only")
+    if len(requested) != 1 and (
+        args.base_dir or args.previous_results_dir or args.results_dir
+        or args.late_organ_results_dir or args.late_patch_results_dir
+    ):
+        raise ValueError("Path overrides require exactly one experiment in --only")
 
     seeds = cfg_module.RANDOM_SEEDS if args.all_seeds else [args.seed]
 
