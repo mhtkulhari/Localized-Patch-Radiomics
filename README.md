@@ -8,275 +8,243 @@ A reproducible machine-learning pipeline for detecting **clinically significant 
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Clinical Motivation](#clinical-motivation)
-3. [Prediction Tasks](#prediction-tasks)
-4. [Data](#data)
-5. [Experimental Design](#experimental-design)
-6. [Pipeline Architecture](#pipeline-architecture)
-7. [Repository Layout](#repository-layout)
-8. [Installation](#installation)
-9. [Commands](#commands)
-10. [Outputs](#outputs)
-
----
-
-## Overview
-
-Prostate MRI is highly informative but operator-dependent, and radiomic signatures can vary with segmentation, feature representation, and validation design. In this work I set out to answer a focused methodological question:
-
-> *Given the same patients and the same rigorously controlled validation, which image representation — localized patch descriptors, whole-organ handcrafted radiomics, or a fusion of the two — best supports the detection and zonal characterisation of clinically significant prostate cancer, and does any advantage survive external validation?*
-
-To answer it, I build a family of feature representations from the same cohort, evaluate every representation with an identical **nested cross-validation** procedure, combine the strongest base models through a **stacked ensemble**, and finally re-fit deployable models on the full training set for **external validation** on a held-out cohort. I seed-control every stochastic choice and repeat it across multiple seeds, so that the differences I report reflect signal rather than a fortunate data split.
-
----
-
-## Clinical Motivation
-
-Not every prostate lesion warrants intervention. Distinguishing **clinically significant** disease from indolent findings is central to reducing over-treatment, and the **zone** in which a significant lesion arises (peripheral vs. transition) carries different diagnostic priors and imaging appearances. I therefore treat detection and zonal characterisation as two linked but distinct problems, and evaluate both.
-
----
-
-## Prediction Tasks
-
-I train and evaluate two binary tasks derived from the reference labels:
-
-| Task key | Question | Positive / Negative | Cohort used |
-|----------|----------|---------------------|-------------|
-| `cs`   | Is clinically significant cancer present? | `TRUE` vs `FALSE` (`clin_sig`) | All labelled cases |
-| `zone` | For significant cases, which zone? | Transition (`TZ`) vs Peripheral (`PZ`) | csPCa-positive cases only |
-
-For cross-validation, cases are stratified on a combined **three-class** label — `FALSE`, `TRUE_PZ`, `TRUE_TZ` — so that both disease status and zone are balanced across folds.
+1. [Data](#data)
+2. [Experiments](#experiments)
+3. [Task Routes](#task-routes)
+4. [Pipeline](#pipeline)
+5. [Setup](#setup)
+6. [Running](#running)
+7. [Full Run](#full-run)
+8. [Individual Run](#individual-run)
+9. [Outputs](#outputs)
+10. [Status](#status)
+11. [Acknowledgements](#acknowledgements)
 
 ---
 
 ## Data
 
-I use three cohorts, each organised into modality/mask sub-folders with per-case image files and an accompanying label spreadsheet:
+The configured datasets are:
 
-| Role | Cohort | Purpose |
-|------|--------|---------|
-| **Main (internal)** | ProstateX | Model development and nested cross-validation |
-| **Helper (external)** | PICAI | Training the patch-level helper models only |
-| **Test (external)** | Independent cohort (`P158`) | Final held-out validation, no refitting |
+| Role | Folder | Use |
+|------|--------|-----|
+| Main | `Train_Main (ProstateX)` | Internal model development and nested cross-validation |
+| Helper | `Train_Helper (PICAI)` | Patch helper-model training |
+| External test | `Test (P158)` | Held-out external evaluation |
 
-Each case provides co-registered **T2W** and **ADC** volumes with an organ (prostate) mask; the main cohort additionally provides **two independent organ segmentations** (`mask_organ`, `mask_organ (b)`), which are used to quantify feature reproducibility (see [Methodological Safeguards](#methodological-safeguards)). Lesion and zone masks, where available, support patch labelling and quality control.
+Expected input layout:
 
-```
+```text
 Input/
 ├── Train_Main (ProstateX)/
-│   ├── original/{t2w, adc, mask_organ, mask_organ (b), mask_lesion, mask_zone}/
+│   ├── original/{t2w,adc,mask_organ,mask_organ (b),mask_lesion,mask_zone}/
 │   └── ProstateX-Dataset.xlsx
 ├── Train_Helper (PICAI)/
-│   └── original/{t2w, adc, mask_organ, mask_lesion, mask_zone}/
+│   └── original/{t2w,adc,mask_organ,mask_lesion,mask_zone}/
 └── Test (P158)/
-    ├── original/{t2w, adc, mask_organ}/
+    ├── original/{t2w,adc,mask_organ}/
     └── P158-Dataset.xlsx
 ```
 
-The preprocessing stage resamples each volume to a common spacing and produces an organ-centred crop under a parallel `preprocessed/` folder; all downstream stages read from there.
+The input folder is available from [Google Drive](https://drive.google.com/drive/folders/1oW_m37vEN7BitG1HHcwMgKGtvctIAdc4?usp=sharing).
 
-### Obtaining the data
+Preprocessing resamples each volume to the configured spacing and writes organ-centred crops under each cohort's `preprocessed/` directory.
 
-The complete `Input/` folder — organised exactly as shown above — is available for download:
+Original dataset references:
 
-📁 **[Download the `Input/` folder (Google Drive)](https://drive.google.com/drive/folders/1oW_m37vEN7BitG1HHcwMgKGtvctIAdc4?usp=sharing)**
-
-Download it and place it under your project root, next to `Code/` (see [Installation → Step 1](#installation)).
-
-Every cohort I use comes **exclusively from publicly released prostate-MRI datasets** (ProstateX for development and PICAI for the patch-helper training, plus the public external test cohort). Crucially, **I removed no case**: I keep every publicly available case rather than curating the data down to an easier subset. I made this choice deliberately to keep the evaluation unfiltered, so that the performance I report reflects a realistic and more generalizable cohort.
+- ProstateX: Litjens G, Debats O, Barentsz J, Karssemeijer N, Huisman H. *SPIE-AAPM PROSTATEx Challenge Data (Version 2)*. The Cancer Imaging Archive; 2017. [doi:10.7937/K9TCIA.2017.MURS5CL](https://doi.org/10.7937/K9TCIA.2017.MURS5CL)
+- PI-CAI: Saha A, Bosma JS, Twilt JJ, et al. Artificial intelligence and radiologists in prostate cancer detection on MRI (PI-CAI): an international, paired, non-inferiority, confirmatory study. *Lancet Oncology*. 2024;25:879-887. [doi:10.1016/S1470-2045(24)00220-1](https://doi.org/10.1016/S1470-2045(24)00220-1)
+- P158: Adams LC, Makowski MR, Engel G, et al. Prostate158 - An expert-annotated 3T MRI dataset and algorithm for prostate cancer detection. *Computers in Biology and Medicine*. 2022;148:105817. [doi:10.1016/j.compbiomed.2022.105817](https://doi.org/10.1016/j.compbiomed.2022.105817)
 
 ---
 
-## Experimental Design
+## Experiments
 
-I evaluate five experiment arms under the same folds and seeds. Each produces the same nine feature files (single-modality, concatenation, element-wise interactions, and their multi-way fusions), so I compare the representations on completely equal footing.
+| Key | Name | Method |
+|-----|------|--------|
+| `A` | `A_Patch` | Multi-scale localized patch descriptors |
+| `B` | `B_Organ` | Whole-organ handcrafted radiomic and topological features retained after inter-segmentation ICC filtering |
+| `B0` | `B_Organ_same` | Patch-style raw-image features calculated over the whole-organ ROI |
+| `C` | `C_Early` | A and B feature columns merged by `case_id` before machine learning |
+| `D` | `D_Late` | Rank-normalized final A and B scores combined as `alpha * A + (1 - alpha) * B`; `alpha = 0.5` is configured in `all_config.py` |
 
-| Arm | Name | Representation |
-|-----|------|----------------|
-| **A** | `A_Patch` | Multi-scale **patch descriptors**: helper models trained on the external cohort, applied across the prostate ROI, and aggregated into case-level features |
-| **B** | `B_Organ` | **Handcrafted organ radiomics** (Laws, Gabor, Haralick/GLCM, gradient, gray-level, and topological descriptors), filtered for inter-segmentation stability |
-| **B0** | `B_Organ_same` | The patch model's raw-image features computed over the whole organ ROI — an internal control isolating *representation* from *localization* (nested CV only; never externally tested) |
-| **C** | `C_Early` | **Early fusion**: organ and patch features merged at the feature level |
-| **D** | `D_Late` | **Late fusion**: organ and patch prediction scores rank-normalised and blended over a weight grid |
+The configured feature files are:
 
-**Feature sets (per arm):** `t2w`, `adc`, `concat`, `hada` (element-wise product), `diff` (difference), and the fusions `fusion(cd)`, `fusion(dh)`, `fusion(ch)`, `fusion(cdh)`.
+- `feature--concat.csv`
+- `feature--fusion(dh).csv`
 
-**Modelling grid.** Within each outer fold, an inner search tunes:
+The classical ML configuration uses L1-embedded feature selection, optional PCA, and logistic regression or linear discriminant analysis. Preprocessing and feature selection are fitted only on each training partition.
 
-- **Feature selection** — ANOVA *F*-test filter, or L1-embedded logistic-regression selection.
-- **Dimensionality reduction** — optional PCA (retained variance grid).
-- **Classifier** — logistic regression, linear SVM, Gaussian naïve Bayes, or linear discriminant analysis.
+### Task Routes
 
-All per-fold preprocessing (median imputation, quasi-constant removal, correlation pruning, z-score scaling, PCA) is fitted on the **training partition only** and applied to the validation/test partition, so no target information leaks across the fold boundary.
-
-**Stacking.** For each task and outer fold, the top base candidates (ranked by inner out-of-fold AUC) are combined by a meta-learner; the ensemble rule — single best, simple average, performance-weighted average, or a logistic-regression stacker — is selected by out-of-fold performance rather than test performance.
-
-**External validation.** After cross-validation, deployable models are re-fitted on the entire main cohort (with out-of-fold predictions preserved for the stacker) and applied **without refitting** to the independent test cohort.
+- A csPCa: summary features, nested CV, and final stacking
+- A zone: max-pool multiple-instance model from patch detection bags
+- B, B0, and C: classical ML and final stacking for both tasks
+- D: final A and B scores for each task, using the same score-fusion rule internally and externally
 
 ---
 
-## Pipeline Architecture
+## Pipeline
 
-The stages run in sequence and are chained by the orchestrator, but each is also runnable in isolation:
+```text
+a_preprocess
+├── b_patch
+│   ├── A summary features -> e_ml (cs) -> f_stack
+│   └── A detection bags -> g_maxPool (zone)
+├── c_organ
+│   └── B/B0 features -> e_ml (cs, zone) -> f_stack
+├── d_fusion --stage early
+│   └── C features -> e_ml (cs, zone) -> f_stack
+└── d_fusion --stage late
+    └── final A/B scores -> D final_stacking.xlsx
 
+h_train -> deployable A/B/B0/C models
+i_test  -> external A/B/B0/C predictions -> external D score fusion
 ```
-a_preprocess  →  b_patch      →  c_organ     →  d_fusion    →  e_ml        →  f_stack     →  g_train      →  h_test
- resample/crop   patch models    organ         early & late    nested-CV      stacked        deployable      external
-                 + application    radiomics     fusion          feature+model  ensemble       refit           validation
-                                  + ICC filter                  search
-```
 
-| Stage | Script | Responsibility |
-|-------|--------|----------------|
-| Config | `all_config.py` | Single source of truth: paths, seeds, feature sets, hyper-parameter grids, I/O helpers |
-| Preprocess | `a_preprocess.py` | Resampling to common spacing and organ-centred cropping; quality-control filtering |
-| Patch | `b_patch.py` | Trains multi-scale patch classifiers on the helper cohort and applies them across the organ ROI to build patch features |
-| Organ | `c_organ.py` | Extracts handcrafted radiomic and topological features and retains only inter-segmentation–stable features (ICC) |
-| Fusion | `d_fusion.py` | Builds early-fusion feature workbooks and computes late-fusion score blends |
-| ML | `e_ml.py` | Nested cross-validated feature selection and classification for every feature set |
-| Stacking | `f_stack.py` | Selects and combines base models into a stacked ensemble per task and fold |
-| Train | `g_train.py` | Re-fits deployable models on the full main cohort |
-| Test | `h_test.py` | Applies deployable models to the external cohort; optionally merges external metrics into the analysis workbooks |
-| Orchestrator | `z_main.py` | Runs the entire study end-to-end with caching and per-seed bookkeeping |
+| Script | Responsibility |
+|--------|----------------|
+| `all_config.py` | Paths, seeds, feature sets, model configuration, and late-fusion alpha |
+| `a_preprocess.py` | Resampling and organ-centred cropping |
+| `b_patch.py` | Patch helper-model training, inference, and summary-feature construction |
+| `c_organ.py` | Organ feature extraction and ICC filtering |
+| `d_fusion.py` | Early-fusion feature construction and internal D score fusion |
+| `e_ml.py` | Nested cross-validation for workbook-based experiments |
+| `f_stack.py` | Final prediction aggregation for the configured experiments |
+| `g_maxPool.py` | Internal and deployable A zone max-pool models |
+| `h_train.py` | Full-training-set refit for deployable A, B, B0, and C models |
+| `i_test.py` | External feature preparation, prediction, and D score fusion |
+| `z_main.py` | End-to-end orchestration, dependency checks, and caching |
+| `x_results.py` | Internal and external results workbook generation |
+| `x_graphs.py` | Internal and external results graph generation |
 
 ---
 
-## Repository Layout
+## Setup
 
-```
-Code/
-├── all_config.py        # central configuration and shared helpers
-├── a_preprocess.py      # resample + organ-centred crop
-├── b_patch.py           # patch helper models + application (Experiment A)
-├── c_organ.py           # handcrafted organ radiomics + ICC filtering (Experiment B / B0)
-├── d_fusion.py          # early- and late-fusion feature/score construction (C / D)
-├── e_ml.py              # nested cross-validation engine
-├── f_stack.py           # stacked-ensemble meta-learner
-├── g_train.py           # deployable model refit
-├── h_test.py            # external validation
-├── z_main.py            # end-to-end orchestrator
-└── README.md
+The project root must contain the code and input folders:
+
+```text
+<PROJECT_ROOT>/
+├── Code/                   # All python .py code files
+├── Input/                  # Download from provided g-drive link 
+├── logs/                   # Create manually or mkdir -p logs
+└── Output/                 # Created by the pipeline
 ```
 
----
-
-## Installation
-
-The pipeline targets **Python 3.11** and pins its dependencies for reproducibility.
-
-### Step 1 — Place the Code and data under one project root
-
-Put the `Code/` folder (this repository) and the `Input/` data folder side by side inside a single directory of your choice. That directory is your **project root**; the pipeline creates `Output/` and `logs/` next to them automatically.
-
-```
-<PROJECT_ROOT>/            # any location you choose, e.g. /home/user/folder
-├── Code/             # this repository (contains z_main.py, all_config.py, …)
-├── Input/                 # datasets — see the Data section for the exact structure
-├── Output/                # created automatically when you run the pipeline
-└── logs/                  # created for background-run logs (Step 4)
-```
-
-### Step 2 — Point the pipeline at your project root ⚠️ **required**
-
-All paths are resolved from a single constant. Open **`Code/all_config.py`** and change the first line to the absolute path of *your* project root:
+Set `REPO_ROOT` in `all_config.py`:
 
 ```python
-# all_config.py (line 6)
-REPO_ROOT = Path("/home/mht/17MHT/BSPC")     # ← replace with YOUR project root
-# e.g.  REPO_ROOT = Path("/home/user/folder")
+REPO_ROOT = Path("/absolute/path/to/project/root")
 ```
 
-`Input/`, `Output/`, and every dataset path are derived from `REPO_ROOT`, so this one edit is all that is needed to relocate the project. If you skip it, the pipeline will keep looking under the default path from my own setup and fail.
-
-### Step 3 — Create the environment and install dependencies
+The code uses Python 3.11 and the following main packages:
 
 ```bash
 python3.11 -m venv .venv
-source .venv/bin/activate             # Windows: .venv\Scripts\activate
-
-pip install numpy==2.4.3 pandas==3.0.0 scipy==1.17.0 scikit-learn==1.8.0 joblib==1.5.3 SimpleITK==2.5.3 scikit-image==0.26.0 openpyxl==3.1.5
-
-pip install cupy-cuda12x     # or cupy-cuda11x, depending on your CUDA version (Optional, falls back to NumPy)
+source .venv/bin/activate
+pip install numpy pandas scipy scikit-learn joblib SimpleITK scikit-image openpyxl matplotlib torch
 ```
 
-Find your interpreter path for later (needed for background runs):
-
-```bash
-which python        # e.g. /home/user/folder/.venv/bin/python
-```
+CuPy is optional. `c_organ.py` falls back to NumPy when CuPy is unavailable.
 
 ---
 
-## Commands
+## Running
+
+Replace `<PYTHON>` with Python executable from configured environment. i.e `/home/mht/miniconda3/envs/mht/bin/python`
+
+Run commands from `<PROJECT_ROOT>` i.e. cd "/home/mht/17MHT/BSPC"
+
+Supported arguments:
+
+| Option | Effect |
+|--------|--------|
+| `--only A,B,B0,C,D` | Run only the listed experiments |
+| `--seed N` | Run one seed; default is `42` |
+| `--all-seeds` | Run seeds `7,21,42,73,101` |
+| `--skip-external` | Skip external evaluation |
+| `--external-experiments A,B,B0,C,D` | Select external experiments; default matches `--only` |
+
+### Full Run
 
 ```bash
-python z_main.py
+nohup <PYTHON> -u "Code/z_main.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_z_main.log" 2>&1 &
 ```
 
-This preprocesses the data, builds every feature representation, runs nested cross-validation and stacking for all arms, and — if the external cohort is present — refits deployable models and validates them externally. Intermediate results are cached, so re-running resumes rather than recomputing.
+### Individual Run
 
-| Flag | Effect |
-|------|--------|
-| `--only A,B,C` | Restrict to specific experiment arms (`A,B,B0,C,D`) |
-| `--seed N` | Run a single random seed (default `7`; valid seeds `7,21,42,73,101`) |
-| `--all-seeds` | Repeat the whole study across all seeds for robustness |
-| `--skip-stacking` | Skip the stacked-ensemble stage |
-| `--skip-external` | Skip external validation |
-| `--no-deep-analysis` | Run external validation without merging external metrics into the analysis workbooks |
-| `--stacking-top-k K` | Number of base candidates retained per task/fold (default `8`) |
-| `--alpha-grid a,b,c` | Late-fusion weight grid (default `0.25,0.5,0.75`) |
-
-### Running in the background
-
-A full run can take hours, so I launch it with `nohup` from the project root (the folder holding `Code/` and `Input/`), with all output streamed to a timestamped file under `logs/`:
+Run an individual command after its required upstream outputs are available.
 
 ```bash
-cd <PROJECT_ROOT>
-mkdir -p logs
+nohup <PYTHON> -u "Code/z_main.py" --only A > "logs/Code_$(date +%Y%m%d_%H%M%S)_z_main_A.log" 2>&1 &
 
-# Full study — all experiments (A, B, B0, C, D)
-nohup <PYTHON> -u "Code/z_main.py" --all-seeds > "logs/Code_$(date +%Y%m%d_%H%M%S)_z_main.log" 2>&1 &
+nohup <PYTHON> -u "Code/a_preprocess.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_a_preprocess.log" 2>&1 &
+nohup <PYTHON> -u "Code/b_patch.py" --stage all > "logs/Code_$(date +%Y%m%d_%H%M%S)_b_patch.log" 2>&1 &
+nohup <PYTHON> -u "Code/c_organ.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_c_organ_B.log" 2>&1 &
+nohup <PYTHON> -u "Code/c_organ.py" --same > "logs/Code_$(date +%Y%m%d_%H%M%S)_c_organ_B0.log" 2>&1 &
+nohup <PYTHON> -u "Code/d_fusion.py" --stage early > "logs/Code_$(date +%Y%m%d_%H%M%S)_d_fusion_early.log" 2>&1 &
+nohup <PYTHON> -u "Code/d_fusion.py" --stage late > "logs/Code_$(date +%Y%m%d_%H%M%S)_d_fusion_late.log" 2>&1 &
+nohup <PYTHON> -u "Code/e_ml.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_e_ml.log" 2>&1 &
+nohup <PYTHON> -u "Code/f_stack.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_f_stack.log" 2>&1 &
+nohup <PYTHON> -u "Code/g_maxPool.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_g_maxPool.log" 2>&1 &
+nohup <PYTHON> -u "Code/h_train.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_h_train.log" 2>&1 &
+nohup <PYTHON> -u "Code/i_test.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_i_test.log" 2>&1 &
 
-# A single experiment arm, e.g. A_Patch only
-nohup <PYTHON> -u "Code/z_main.py" --all-seeds --only A > "logs/Code_$(date +%Y%m%d_%H%M%S)_z_main_A.log" 2>&1 &
-```
-
-| Placeholder | Replace with |
-|-------------|--------------|
-| `<PROJECT_ROOT>` | The folder holding `Code/` and `Input/` e.g. `/home/user/folder` |
-| `<PYTHON>` | Your environment's Python interpreter, e.g. `/home/user/folder/.venv/bin/python` |
-
-Every stage can also be run on its own, the same way:
-
-```bash
-nohup <PYTHON> -u "Code/b_patch.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_b_patch.log" 2>&1 &          # A_Patch
-nohup <PYTHON> -u "Code/c_organ.py"  > "logs/Code_$(date +%Y%m%d_%H%M%S)_c_organ.log" 2>&1 &         # B_Organ
-nohup <PYTHON> -u "Code/c_organ.py" --same > "logs/Code_$(date +%Y%m%d_%H%M%S)_c_organ_same.log" 2>&1 &    # B_Organ_same
-nohup <PYTHON> -u "Code/d_fusion.py" --stage early > "logs/Code_$(date +%Y%m%d_%H%M%S)_d_fusion_early.log" 2>&1 &  # C_Early
-nohup <PYTHON> -u "Code/d_fusion.py" --stage late > "logs/Code_$(date +%Y%m%d_%H%M%S)_d_fusion_late.log" 2>&1 &   # D_Late
-nohup <PYTHON> -u "Code/e_ml.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_e_ml.log" 2>&1 &            # nested-CV ML search
-nohup <PYTHON> -u "Code/f_stack.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_f_stack.log" 2>&1 &         # stacking
-nohup <PYTHON> -u "Code/g_train.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_g_train.log" 2>&1 &         # deployable train
-nohup <PYTHON> -u "Code/h_test.py" --prepare > "logs/Code_$(date +%Y%m%d_%H%M%S)_h_test.log" 2>&1 &         # external test
+nohup <PYTHON> -u "Code/x_results.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_x_results.log" 2>&1 &
+nohup <PYTHON> -u "Code/x_graphs.py" > "logs/Code_$(date +%Y%m%d_%H%M%S)_x_graphs.log" 2>&1 &
 ```
 
 ---
 
 ## Outputs
 
-Results are written under `Output/`, organised by experiment arm and, within each, by random seed:
+Results are written under `Output/`:
 
-```
+```text
 Output/
-├── A_Patch/      # Arm A — localized multi-scale patch-radiomics experiment
-├── B_Organ/      # Arm B — whole-organ improved handcrafted-radiomics experiment
-├── B_Organ_same/ # Arm B0 — whole-organ handcrafted-radiomics experiment (same raw features as A)
-├── C_Early/      # Arm C — early (extracted-feature level) fusion of A + B
-└── D_Late/       # Arm D — late (prediction-score level) fusion of A + B
+├── A_Patch/
+│   ├── 01_raw_features_helper/
+│   ├── 02_models_helper/
+│   ├── 03_raw_features_main/
+│   ├── 04_detection_by_helper/
+│   │   ├── concat/
+│   │   └── fusion(dh)/
+│   ├── 05_summary_features/
+│   ├── 06_results/random_seed{N}/
+│   │   ├── final_stacking.xlsx
+│   │   └── maxpool_zone.xlsx
+│   ├── 07_final_model/random_seed{N}/
+│   └── 08_external_testing/
+│       ├── 01_summary_features/
+│       └── 02_results/ext_results_seed{N}.xlsx
+├── B_Organ/
+│   ├── 01_raw_features/
+│   ├── 02_selected_features/
+│   ├── 03_results/random_seed{N}/final_stacking.xlsx
+│   ├── 04_final_model/random_seed{N}/
+│   └── 05_external_testing/
+│       ├── 01_summary_features/
+│       └── 02_results/ext_results_seed{N}.xlsx
+├── B_Organ_same/
+│   ├── 01_raw_features/
+│   ├── 02_selected_features/
+│   ├── 03_results/random_seed{N}/final_stacking.xlsx
+│   ├── 04_final_model/random_seed{N}/
+│   └── 05_external_testing/
+│       ├── 01_summary_features/
+│       └── 02_results/ext_results_seed{N}.xlsx
+├── C_Early/
+│   ├── 01_fused_features/
+│   ├── 02_results/random_seed{N}/final_stacking.xlsx
+│   ├── 03_final_model/random_seed{N}/
+│   └── 04_external_testing/
+│       ├── 01_summary_features/
+│       └── 02_results/ext_results_seed{N}.xlsx
+└── D_Late/
+    ├── 01_results/random_seed{N}/final_stacking.xlsx
+    └── 02_external_testing/02_results/ext_results_seed{N}.xlsx
 ```
-
-Each arm produces per-feature-set result workbooks (per-fold metrics, combination summaries, selected features), a top-model text report, a stacked-ensemble workbook (`final_stacking.xlsx`), and — for externally validated arms — an external-testing workbook. Reported metrics include AUC, average precision, balanced accuracy, F1, accuracy, sensitivity, and specificity, summarised as mean ± standard deviation across outer folds.
 
 ---
 
